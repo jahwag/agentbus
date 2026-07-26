@@ -2,302 +2,147 @@
 
 [![CI](https://github.com/jahwag/agentbus/actions/workflows/ci.yml/badge.svg)](https://github.com/jahwag/agentbus/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jahwag/agentbus/actions/workflows/codeql.yml/badge.svg)](https://github.com/jahwag/agentbus/actions/workflows/codeql.yml)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-The%20Orchard-5865F2?logo=discord&logoColor=white)](https://discord.gg/pR4qeMH4u4)
 
-Coding agents need to coordinate without losing messages, polling constantly,
-or turning a human chat channel into a machine queue. AgentBus is a small,
-self-hosted mailbox that gives a coding-agent fleet durable agent-to-agent
-messaging through one Go daemon, SQLite, HTTP, and Streamable HTTP MCP.
-
-Messages survive restarts. Deliveries repeat until acknowledged. Agents can
-wait outside the model loop, so an idle fleet does not spend tokens polling.
-
-AgentBus is deliberately narrow: direct messages, broadcasts to the current
-fleet, one logical consumer per identity, and at-least-once delivery. It is
-designed for a single-digit fleet owned by one operator, not as a general
-message broker.
+AgentBus is a small durable mailbox for cooperating AI agents. It provides
+direct messages and broadcasts over HTTP and Streamable HTTP MCP, survives
+restarts, and redelivers messages until they are acknowledged.
 
 ![AgentBus restart and redelivery demo](docs/assets/agentbus-demo.gif)
 
-## Quick start
+Send → wait → restart → redeliver → acknowledge.
 
-Requirements: Go 1.25.12 or newer, GNU Make, and `curl`.
+## Why AgentBus?
 
-```sh
+Agent processes stop, restart, time out, and run at different speeds. Passing
+messages through terminal output or temporary files works until one side is not
+listening.
+
+AgentBus gives each agent a durable mailbox:
+
+- **Direct messages and broadcasts.** Address one agent or a group.
+- **At-least-once delivery.** Unacknowledged messages return with
+  `redelivery=true`.
+- **Stable delivery IDs.** Consumers can make side effects idempotent.
+- **Restart-safe state.** A single SQLite database stores messages, receipts,
+  leases, and audit history.
+- **Agent-native access.** Use the CLI, HTTP API, or MCP from Codex, Claude, and
+  other MCP-capable clients.
+
+It is one Go daemon with no external broker to operate.
+
+## Try it
+
+AgentBus requires Go 1.25 or newer.
+
+```bash
 git clone https://github.com/jahwag/agentbus.git
 cd agentbus
 make build
-
 ./bin/agentbusd --listen 127.0.0.1:7777 --db ./agentbus.db
 ```
 
 In another terminal:
 
-```sh
-./bin/agentbus send --server http://127.0.0.1:7777 \
-  --from reviewer --to implementer --allow-new \
-  --client-message-id demo-1 --body 'Please review the current diff.'
-
-./bin/agentbus wait \
-  --server http://127.0.0.1:7777 --name implementer
+```bash
+curl http://127.0.0.1:7777/readyz
 ```
 
-The daemon is now holding a durable delivery for `implementer`. Process every
-message, deduplicate external side effects by `message_id`, and acknowledge the
-returned `delivery_id`. Until then, another wait returns the same delivery with
-`redelivery=true`.
+For a complete local exercise—including authentication, durable delivery,
+restart redelivery, acknowledgement, pruning, and the operator UI—run:
 
-## Where it fits
-
-AgentBus is useful when a small, self-hosted coding-agent fleet needs:
-
-- durable direct and broadcast communication across process or host restarts;
-- an MCP-native mailbox with the same contract as its HTTP and CLI interfaces;
-- authenticated sender identity and per-agent credentials;
-- bounded, inspectable operations without adopting a general broker.
-
-It complements [Clem](https://github.com/jahwag/clem), which runs persistent
-coding-agent teams. Clem manages the agents; AgentBus gives them a durable
-mailbox. AgentBus can also be used independently with Codex, Claude Code, or
-another MCP-capable agent harness.
-
-It is not a replacement for Kafka, NATS, Redis Streams, or a high-throughput
-queue. Choose those when you need many consumers, partitions, topics, or large
-fleets.
-
-![AgentBus operator dashboard with synthetic fleet traffic](docs/assets/operator-dashboard.png)
-
-## Delivery contract
-
-The normal consumer loop is:
-
-```text
-send(client_message_id, ...) -> stable message_id
-wait()                       -> delivery_id + ordered messages
-process every message
-ack(delivery_id)
-```
-
-`wait` never acknowledges mail. Repeating it before `ack` returns the same
-outstanding delivery with `redelivery=true`. Acknowledgement is durable and
-idempotent while its delivery record remains inside the retention window.
-Message processing is still at-least-once: consumers must deduplicate external
-side effects by `message_id`.
-
-Broadcast recipients are snapshotted when the send commits. A mailbox reserved
-by `allow_new` receives its direct mail but does not receive broadcasts until it
-becomes active.
-
-## Build and verify
-
-The Go patch-level minimum includes required standard-library security fixes.
-
-```sh
-make verify
-make build
+```bash
 make acceptance
 ```
 
-`make verify` includes the race detector. `make acceptance` exercises the
-authenticated daemon, restart/redelivery, and dashboard without printing
-credentials.
+The acceptance script uses an isolated temporary database and cleans up after
+itself.
 
-## Local development
+For prebuilt Linux and macOS archives, checksums, SBOMs, and provenance, see
+the [latest release](https://github.com/jahwag/agentbus/releases/latest).
 
-Auth-off mode is for a trusted local workstation only. Names are caller claims,
-and any process that can reach the port can impersonate any mailbox.
+## How delivery works
 
-```sh
-make build
-./bin/agentbusd --listen 127.0.0.1:7777 --db ./tmp/agentbus.db
+1. A sender supplies a unique `client_message_id`.
+2. AgentBus commits the message before reporting success.
+3. A consumer waits for its next mailbox delivery.
+4. AgentBus leases that delivery to the consumer.
+5. The consumer performs its side effect and acknowledges the delivery ID.
+6. If the lease expires first, the same delivery ID is returned with
+   `redelivery=true`.
 
-./bin/agentbus send --server http://127.0.0.1:7777 \
-  --from reviewer --to implementer --allow-new \
-  --client-message-id local-1 --body 'Please review the current diff.'
+Consumers should deduplicate external side effects by delivery ID and
+acknowledge only after processing succeeds.
 
-./bin/agentbus wait --server http://127.0.0.1:7777 --name implementer
-./bin/agentbus ack --server http://127.0.0.1:7777 \
-  --name implementer --delivery-id DELIVERY_ID
+Broadcasts create an independent receipt for every intended recipient. One
+slow consumer does not block the others.
+
+## Where it fits
+
+Use AgentBus when:
+
+- a small group of local or remote agents needs restart-safe coordination;
+- agents already speak MCP or can call a small HTTP API;
+- you want durable delivery without operating a general-purpose broker;
+- a single-node SQLite-backed service is the right operational size.
+
+Use NATS, Kafka, Redis Streams, RabbitMQ, or a managed queue when you need
+multi-node high availability, very high throughput, partitioned event streams,
+complex routing, or a broad non-agent messaging platform.
+
+AgentBus is intentionally narrower: named agent mailboxes, broadcasts,
+redelivery, acknowledgement, leases, and an operator audit trail.
+
+## Interfaces
+
+- **MCP:** Streamable HTTP tools for agent registration, send, wait,
+  acknowledgement, roster lookup, and related coordination.
+- **CLI:** Administrative and mailbox commands through `bin/agentbus`.
+- **HTTP:** Health, readiness, mailbox, audit, and operator endpoints.
+- **Operator UI:** Capability-scoped inspection without exposing message bodies
+  in activity views.
+
+Run the binaries with `--help` for the current command and configuration
+surface:
+
+```bash
+./bin/agentbus --help
+./bin/agentbusd --help
 ```
 
-`agentbus wait` absorbs normal long-poll timeouts and transient connection
-failures inside the process. It exits only after validating a nonempty delivery,
-which lets a background task remain idle without consuming model tokens.
+A ready-to-adapt Codex MCP configuration is available at
+[`deploy/codex/agentbus.toml`](deploy/codex/agentbus.toml).
 
-## Authenticated deployment
+## Security and deployment
 
-Production uses one strong admin credential and a distinct credential per agent.
-Secrets are read from protected files; do not put literal values in command-line
-arguments, repository configuration, unit definitions, or logs. MCP harnesses
-may load an agent's own token into an environment variable from a protected
-environment file.
+The unauthenticated local setup above is for a trusted development workstation
+only. For shared hosts or networks:
 
-```sh
-make build
-sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin agentbus
-sudo install -m 0755 bin/agentbus bin/agentbusd /usr/local/bin/
-sudo install -d -m 0700 /etc/agentbus
-sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/agentbus/admin-token'
-sudo install -d -m 0700 /etc/agentbus/agents /run/agentbus-mint
-sudo install -m 0644 deploy/systemd/agentbusd.service /etc/systemd/system/
-sudo install -m 0644 deploy/systemd/agentbus-prune.service /etc/systemd/system/
-sudo install -m 0644 deploy/systemd/agentbus-prune.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now agentbusd.service agentbus-prune.timer
-curl --retry 10 --retry-connrefused --retry-delay 1 \
-  --fail http://127.0.0.1:7777/readyz
+- enable authentication and issue a separate capability-scoped token to each
+  agent;
+- keep the daemon on loopback or behind an authenticated TLS reverse proxy;
+- protect the SQLite database and token files with restrictive permissions;
+- never place tokens in command arguments, repository files, or logs.
 
-sudo /usr/local/bin/agentbus mint \
-  --server http://127.0.0.1:7777 \
-  --admin-token-file /etc/agentbus/admin-token \
-  --name reviewer --token-out /run/agentbus-mint/reviewer.token
-sudo sh -c 'umask 077; { printf "AGENTBUS_TOKEN="; tr -d "\n" < /run/agentbus-mint/reviewer.token; printf "\n"; } > /etc/agentbus/agents/.reviewer.env.new; sync -f /etc/agentbus/agents/.reviewer.env.new; mv -f /etc/agentbus/agents/.reviewer.env.new /etc/agentbus/agents/reviewer.env'
-sudo rm /run/agentbus-mint/reviewer.token
-```
+Read [SECURITY.md](SECURITY.md) before exposing AgentBus beyond a trusted local
+machine. Operational defaults and recovery procedures live in
+[RUNBOOK.md](RUNBOOK.md), with deployable examples under [`deploy/`](deploy/).
 
-The root-owned `0600` environment file is the durable credential copy used by
-the agent service drop-in. `/run/agentbus-mint` is only a protected staging
-area; never leave an agent's only credential there because it is cleared on
-reboot. Repeat the mint-and-convert sequence for each OS-isolated agent.
+## Project scope
 
-The supported VPS topology is `Caddy TLS -> 127.0.0.1:7777 -> agentbusd`.
-The [systemd notes](deploy/systemd) cover upgrades and backup. Each agent should
-run as a separate unprivileged OS identity whose process receives only its own
-credential; otherwise bearer identity is attribution, not isolation.
+AgentBus is a focused coordination primitive, not an agent runtime or task
+scheduler. [Clem](https://github.com/jahwag/clem) runs and isolates coding
+agents; AgentBus lets agents exchange durable messages. The projects are
+independent and can be used separately.
 
-### Remote HTTPS with Caddy
+The protocol and implementation decisions are documented in
+[`docs/adr/`](docs/adr/).
 
-Prerequisites are a DNS name pointing to the VPS and inbound TCP 80/443.
-AgentBus has no public plaintext mode: `agentbusd` stays on
-`127.0.0.1:7777`, the CLI rejects non-loopback `http://` URLs, and Caddy
-returns `426 Upgrade Required` on port 80. That response is diagnostic; it
-cannot protect a bearer token a different client already sent in plaintext.
+## Community
 
-Install Caddy. On a new Caddy host, install the example and edit its email and
-hostname; on an existing host, merge its site blocks instead of overwriting the
-current configuration.
-
-```sh
-sudo install -m 0644 deploy/Caddyfile.example /etc/caddy/Caddyfile
-sudoedit /etc/caddy/Caddyfile
-sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl enable caddy
-sudo systemctl reload-or-restart caddy
-```
-
-Caddy obtains and renews the certificate automatically. TLS terminates there;
-the upstream hop is HTTP over loopback. Remote MCP clients use
-`https://agentbus.example.com/mcp`. Admin commands intentionally run on the
-host against `http://127.0.0.1:7777`; do not add their routes or `/ui/*` to the
-public Caddy allowlist.
-
-Verify the deployment (expected public status codes: 200, 426, 404):
-
-```sh
-curl --fail https://agentbus.example.com/readyz
-curl -sS -o /dev/null -w '%{http_code}\n' http://agentbus.example.com/healthz
-curl -sS -o /dev/null -w '%{http_code}\n' https://agentbus.example.com/ui/
-ss -ltn 'sport = :7777' # only 127.0.0.1 and/or [::1]
-```
-
-## Operator dashboard
-
-Authenticated deployments include a read-only dashboard on the daemon's
-existing loopback port. It shows since-tracking counters, current mailbox
-delivery state, and newest-first retained routing metadata. The default query
-never loads message body, structured data, reply target, or client idempotency
-key. Selecting **Reveal** fetches one message separately and renders the chosen
-body and data as untrusted escaped text.
-
-The dashboard is embedded in `agentbusd`, enabled by default only with
-authentication, and removable with `--ui=false`.
-
-Keep the dashboard off the public reverse proxy. Reach it through an SSH
-tunnel, and mint the browser's short-lived capability on the daemon host:
-
-```sh
-# Local terminal 1: leave the tunnel running.
-ssh -N -o ExitOnForwardFailure=yes -L 17777:127.0.0.1:7777 agentbus-host
-
-# Local terminal 2: the root admin credential stays on the host.
-ssh agentbus-host 'sudo /usr/local/bin/agentbus ui-session \
-  --admin-token-file /etc/agentbus/admin-token'
-```
-
-Open `http://agentbus.localhost:17777/ui/` and paste the returned code. The
-dedicated localhost name reduces accidental cookie exposure to unrelated
-services on `127.0.0.1`. Codes are single-use for two minutes; read-only browser
-sessions expire after eight hours or a daemon restart. The Caddy allowlist
-returns 404 for all dashboard and administrator routes.
-
-## MCP and HTTP
-
-MCP clients connect to `/mcp` and send their agent bearer credential in the
-`Authorization` header. Configure the value through the client or harness secret
-facility; never commit a literal token.
-
-For Codex, keep the token in the agent's protected environment and use the
-documented bearer-token setting. The tool timeout must exceed AgentBus's
-290-second long poll:
-
-```toml
-[mcp_servers.agentbus]
-url = "http://127.0.0.1:7777/mcp"
-bearer_token_env_var = "AGENTBUS_TOKEN"
-tool_timeout_sec = 300
-```
-
-The same non-secret stanza is shipped at
-[deploy/codex/agentbus.toml](deploy/codex/agentbus.toml). A systemd drop-in
-example for loading each agent's root-owned environment file is under
-[deploy/systemd](deploy/systemd).
-
-HTTP API routes:
-
-- `POST /send`, `GET /wait`, and `POST /ack` for agents;
-- `GET /roster` for authenticated callers;
-- `POST /mint`, `/skip`, `/retire`, and `/prune` for the administrator;
-- `GET /backlog`, body-free `/activity`, and cursor-paginated
-  `/audit?after_id=N&limit=100` for the administrator (`limit` is capped at
-  1,000);
-- loopback-only `POST /ui/bootstrap` for the admin CLI and capability-scoped,
-  read-only `/ui/*` browser routes when authentication is enabled;
-- unauthenticated `/healthz` and `/readyz` probes.
-
-Mailbox and MCP responses are non-cacheable. Requests and deliveries are
-bounded. The daemon rejects insecure non-loopback operation; TLS is terminated
-by the supplied Caddy topology.
-
-## Security boundary
-
-Message bodies and structured data are untrusted input, even when the sender is
-authenticated. Sender stamping proves provenance, not authority. A bus message
-must never by itself authorize secret access, destructive changes, or
-publication. Enforce those controls in agent permissions and OS-level secret
-isolation. See [SECURITY.md](SECURITY.md) before deploying.
-
-AgentBus is not end-to-end encrypted. Message content is readable in SQLite by
-the daemon account, root, and authorized operators; HTTPS protects only network
-transit.
-
-## Operations and backup
-
-Use `agentbus activity` for body-free adoption counters and `agentbus backlog`
-for abandoned or redelivered mail. Poison mail requires an explicit `skip`, and
-decommissioned identities require `retire`; accepted mail is never silently
-discarded.
-
-Never copy a live `bus.db` alone because committed state may still be in its
-WAL. Follow the cold backup, restore-drill, upgrade, and rollback procedure in
-[deploy/systemd/README.md](deploy/systemd/README.md). Migrations are
-forward-only; pair an older binary with its schema-compatible cold backup.
-
-Design details: [PLAN.md](PLAN.md), [CONTEXT.md](CONTEXT.md),
-[ADRs](docs/adr), and [release checks](RELEASE_CHECKS.md).
-
-## License and support
-
-AgentBus is open-source software available under the [MIT License](LICENSE).
-Contribution and support expectations are documented in
-[CONTRIBUTING.md](CONTRIBUTING.md) and [SUPPORT.md](SUPPORT.md).
+- Questions and usage help: [The Orchard Discord](https://discord.gg/pR4qeMH4u4)
+- Bugs and feature requests: [GitHub Issues](https://github.com/jahwag/agentbus/issues)
+- Contribution expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Support policy: [SUPPORT.md](SUPPORT.md)
+- License: [MIT](LICENSE)
