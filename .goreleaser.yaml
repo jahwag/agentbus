@@ -1,0 +1,82 @@
+version: 2
+
+project_name: agentbus
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - &agentbus-build
+    id: agentbusd
+    main: ./cmd/agentbusd
+    binary: agentbusd
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - >-
+        -s -w -buildid=
+        -X github.com/jahwag/agentbus/internal/buildinfo.Version={{.Version}}
+        -X github.com/jahwag/agentbus/internal/buildinfo.Revision={{.FullCommit}}
+        -X github.com/jahwag/agentbus/internal/buildinfo.Date={{.CommitDate}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+  - <<: *agentbus-build
+    id: agentbus
+    main: ./cmd/agentbus
+    binary: agentbus
+
+archives:
+  - id: native
+    ids: [agentbusd, agentbus]
+    formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE
+      - README.md
+      - PLAN.md
+      - CONTEXT.md
+      - SECURITY.md
+      - CONTRIBUTING.md
+      - SUPPORT.md
+      - CODE_OF_CONDUCT.md
+      - RELEASE_CHECKS.md
+      - THIRD_PARTY_NOTICES
+      - docs/adr/0001-materialized-mailbox-receipts.md
+      - docs/adr/0002-stateless-mcp-per-request-auth.md
+      - docs/adr/0003-use-capability-scoped-operator-ui.md
+      - deploy/codex/agentbus.toml
+      - deploy/systemd/README.md
+      - deploy/systemd/agent-credential-dropin.conf.example
+      - deploy/systemd/agentbusd.service
+      - deploy/systemd/agentbus-prune.service
+      - deploy/systemd/agentbus-prune.timer
+      - deploy/Caddyfile.example
+    wrap_in_directory: true
+    builds_info:
+      mtime: '{{ .CommitDate }}'
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  ids: [native]
+
+sboms:
+  - id: archives
+    artifacts: archive
+    documents:
+      - '{{ .ArtifactName }}.spdx.json'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+
+release:
+  draft: true
+  prerelease: auto

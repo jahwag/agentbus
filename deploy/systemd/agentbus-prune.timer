@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune terminal AgentBus records daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+AccuracySec=1m
+Unit=agentbus-prune.service
+
+[Install]
+WantedBy=timers.target

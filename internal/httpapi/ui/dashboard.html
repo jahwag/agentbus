@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentBus · Traffic</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">AgentBus operator console</p>
+      <h1>Fleet traffic</h1>
+    </div>
+    <form method="post" action="/ui/logout"><button class="button-secondary" type="submit">Log out</button></form>
+  </header>
+  <main class="page-shell">
+    <p class="notice">Retained recent traffic only. Content stays on the server until you explicitly reveal one message.</p>
+    <section class="stats" aria-label="Traffic summary">
+      <article><span>Messages sent</span><strong>{{.Activity.SinceTracking.MessagesSent}}</strong></article>
+      <article><span>Receipts enqueued</span><strong>{{.Activity.SinceTracking.ReceiptsEnqueued}}</strong></article>
+      <article><span>Acknowledged</span><strong>{{.Activity.SinceTracking.ReceiptsAcked}}</strong></article>
+      <article><span>Pending now</span><strong>{{.Activity.Current.PendingReceipts}}</strong></article>
+      <article><span>Offered now</span><strong>{{.Activity.Current.OfferedReceipts}}</strong></article>
+      <article><span>Dead-lettered</span><strong>{{.Activity.SinceTracking.ReceiptsDead}}</strong></article>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading"><div><p class="eyebrow">Mailboxes</p><h2>Delivery state</h2></div><span>As of {{.Activity.AsOf}}</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>State</th><th>Sent</th><th>Enqueued</th><th>Acked</th><th>Pending</th><th>Offered</th><th>Last seen</th></tr></thead>
+          <tbody>
+          {{range .Activity.Mailboxes}}
+            <tr><td class="name">{{.Name}}</td><td><span class="pill">{{.State}}</span></td><td>{{.SinceTracking.MessagesSent}}</td><td>{{.SinceTracking.ReceiptsEnqueued}}</td><td>{{.SinceTracking.ReceiptsAcked}}</td><td>{{.Current.PendingReceipts}}</td><td>{{.Current.OfferedReceipts}}</td><td class="timestamp">{{if .LastSeen}}{{.LastSeen}}{{else}}—{{end}}</td></tr>
+          {{else}}<tr><td colspan="8" class="empty">No active mailboxes yet.</td></tr>{{end}}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading"><div><p class="eyebrow">Routing metadata</p><h2>Recent messages</h2></div><span>Newest first</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Seq</th><th>From</th><th>To</th><th>Receipts</th><th>Time</th><th><span class="visually-hidden">Action</span></th></tr></thead>
+          <tbody>
+          {{range .Routes}}
+            <tr>
+              <td class="sequence">#{{.Seq}}</td><td class="name">{{.From}}</td><td class="name">{{.To}}</td>
+              <td class="receipt-summary"><span title="pending">P {{.Receipts.Pending}}</span><span title="offered">O {{.Receipts.Offered}}</span><span title="acknowledged">A {{.Receipts.Acked}}</span><span title="dead-lettered">D {{.Receipts.Dead}}</span></td>
+              <td class="timestamp">{{.TS}}</td>
+              <td><form method="post" action="/ui/reveal"><input type="hidden" name="message_id" value="{{.MessageID}}"><button class="button-small" type="submit">Reveal</button></form></td>
+            </tr>
+          {{else}}<tr><td colspan="6" class="empty">No retained messages yet.</td></tr>{{end}}
+          </tbody>
+        </table>
+      </div>
+      {{if .HasOlder}}<a class="older-link" href="/ui/?before_seq={{.NextBefore}}">View older traffic →</a>{{end}}
+    </section>
+  </main>
+</body>
+</html>

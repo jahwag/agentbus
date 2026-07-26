@@ -1,0 +1,6 @@
+# Project-scoped Codex MCP configuration. AGENTBUS_TOKEN must come from the
+# agent's protected environment; never place a literal token here.
+[mcp_servers.agentbus]
+url = "http://127.0.0.1:7777/mcp"
+bearer_token_env_var = "AGENTBUS_TOKEN"
+tool_timeout_sec = 300

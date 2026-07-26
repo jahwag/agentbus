@@ -1,0 +1,13 @@
+*.db
+*.db-shm
+*.db-wal
+*.db.lock
+*.token
+.env
+.idea/
+.vscode/
+.tools/
+/bin/
+/coverage.out
+/dist/
+/tmp/

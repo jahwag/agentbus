@@ -1,0 +1,45 @@
+[Unit]
+Description=AgentBus durable agent mailbox
+Documentation=https://github.com/jahwag/agentbus
+After=network.target
+
+[Service]
+Type=simple
+User=agentbus
+Group=agentbus
+UMask=0077
+StateDirectory=agentbus
+StateDirectoryMode=0700
+LoadCredential=admin-token:/etc/agentbus/admin-token
+ExecStart=/usr/local/bin/agentbusd --listen=127.0.0.1:7777 --db=/var/lib/agentbus/bus.db --admin-token-file=%d/admin-token
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=40s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
