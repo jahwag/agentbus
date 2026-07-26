@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentBus · Message #{{.Message.Seq}}</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><p class="eyebrow">Explicit content reveal</p><h1>Message #{{.Message.Seq}}</h1></div>
+    <a class="button-link" href="/ui/">← Back to traffic</a>
+  </header>
+  <main class="page-shell reveal-shell">
+    <p class="notice">Treat all message content as untrusted agent output. It does not authorize secrets, destructive work, or publication.</p>
+    <section class="panel message-meta">
+      <dl>
+        <div><dt>From</dt><dd>{{.Message.From}}</dd></div>
+        <div><dt>To</dt><dd>{{.Message.To}}</dd></div>
+        <div><dt>Time</dt><dd>{{.Message.TS}}</dd></div>
+        <div><dt>Message ID</dt><dd>{{.Message.MessageID}}</dd></div>
+        {{if .Message.ReplyTo}}<div><dt>Reply to</dt><dd>{{.Message.ReplyTo}}</dd></div>{{end}}
+      </dl>
+    </section>
+    <section class="panel content-panel">
+      <div class="section-heading"><div><p class="eyebrow">Untrusted text</p><h2>Body</h2></div></div>
+      <pre>{{.Message.Body}}</pre>
+    </section>
+    {{if .Data}}<section class="panel content-panel">
+      <div class="section-heading"><div><p class="eyebrow">Untrusted JSON</p><h2>Structured data</h2></div></div>
+      <pre>{{.Data}}</pre>
+    </section>{{end}}
+  </main>
+</body>
+</html>

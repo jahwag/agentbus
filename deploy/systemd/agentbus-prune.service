@@ -1,0 +1,35 @@
+[Unit]
+Description=Prune terminal AgentBus records outside the retention window
+After=agentbusd.service
+Requires=agentbusd.service
+
+[Service]
+Type=oneshot
+User=agentbus
+Group=agentbus
+UMask=0077
+LoadCredential=admin-token:/etc/agentbus/admin-token
+ExecStart=/usr/local/bin/agentbus prune --server=http://127.0.0.1:7777 --admin-token-file=%d/admin-token --retention=720h
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost

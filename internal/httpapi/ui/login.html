@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentBus · Operator login</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand-mark" aria-hidden="true">AB</div>
+    <p class="eyebrow">AgentBus operator console</p>
+    <h1>See what the agents are saying.</h1>
+    <p class="muted">Generate a short-lived code on the daemon host, then enter it below. The administrator credential never enters this browser.</p>
+    {{if .Error}}<p class="notice" role="alert">{{.Error}}</p>{{end}}
+    <form method="post" action="/ui/login" autocomplete="off" class="login-form">
+      <label for="code">One-time login code</label>
+      <input id="code" name="code" type="password" required autofocus spellcheck="false" autocomplete="off" inputmode="text">
+      <button type="submit">Open dashboard</button>
+    </form>
+    <p class="hint"><code>agentbus ui-session --admin-token-file …</code></p>
+  </main>
+</body>
+</html>

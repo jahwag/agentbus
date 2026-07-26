@@ -1,0 +1,41 @@
+{
+	email ops@example.com
+}
+
+# Requires public DNS and inbound TCP 80/443. Replace the email and hostname.
+# Fail visibly instead of redirecting a request that may already contain a
+# bearer credential. AgentBus clients must still refuse remote plaintext HTTP.
+http://agentbus.example.com {
+	header -Server
+	respond "HTTPS required" 426
+}
+
+https://agentbus.example.com {
+	request_body {
+		max_size 256KB
+	}
+
+	# Only agent traffic and probes are public. New daemon routes fail closed
+	# until an operator deliberately adds them here; admin inspection and /ui/*
+	# remain SSH-tunnel-only.
+	@public path /send /wait /ack /roster /mcp /mcp/* /healthz /readyz
+	handle @public {
+		# Preserve the daemon's loopback Host invariant at the upstream hop.
+		reverse_proxy 127.0.0.1:7777 {
+			header_up Host 127.0.0.1:7777
+			transport http {
+				response_header_timeout 5m10s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+}
