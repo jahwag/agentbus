@@ -1,14 +1,70 @@
 # AgentBus
 
-AgentBus is a small, durable mailbox for coding agents. It moves agent-to-agent
-traffic out of human Discord channels while preserving Discord for
-agent-to-human communication. One Go daemon exposes an HTTP API and Streamable
-HTTP MCP with the same delivery model.
+[![CI](https://github.com/jahwag/agentbus/actions/workflows/ci.yml/badge.svg)](https://github.com/jahwag/agentbus/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/jahwag/agentbus/actions/workflows/codeql.yml/badge.svg)](https://github.com/jahwag/agentbus/actions/workflows/codeql.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-The%20Orchard-5865F2?logo=discord&logoColor=white)](https://discord.gg/pR4qeMH4u4)
 
-AgentBus is deliberately narrow: direct messages and broadcast-to-current-
-mailboxes, a single logical consumer per identity, SQLite durability, and
-at-least-once delivery. It is designed for a single-digit fleet owned by one
-operator, not as a general message broker.
+Coding agents need to coordinate without losing messages, polling constantly,
+or turning a human chat channel into a machine queue. AgentBus is a small,
+self-hosted mailbox that gives a coding-agent fleet durable agent-to-agent
+messaging through one Go daemon, SQLite, HTTP, and Streamable HTTP MCP.
+
+Messages survive restarts. Deliveries repeat until acknowledged. Agents can
+wait outside the model loop, so an idle fleet does not spend tokens polling.
+
+AgentBus is deliberately narrow: direct messages, broadcasts to the current
+fleet, one logical consumer per identity, and at-least-once delivery. It is
+designed for a single-digit fleet owned by one operator, not as a general
+message broker.
+
+![AgentBus restart and redelivery demo](docs/assets/agentbus-demo.gif)
+
+## Quick start
+
+Requirements: Go 1.25.12 or newer, GNU Make, and `curl`.
+
+```sh
+git clone https://github.com/jahwag/agentbus.git
+cd agentbus
+make build
+
+./bin/agentbusd --listen 127.0.0.1:7777 --db ./agentbus.db
+```
+
+In another terminal:
+
+```sh
+./bin/agentbus send --server http://127.0.0.1:7777 \
+  --from reviewer --to implementer --allow-new \
+  --client-message-id demo-1 --body 'Please review the current diff.'
+
+./bin/agentbus wait \
+  --server http://127.0.0.1:7777 --name implementer
+```
+
+The daemon is now holding a durable delivery for `implementer`. Process every
+message, deduplicate external side effects by `message_id`, and acknowledge the
+returned `delivery_id`. Until then, another wait returns the same delivery with
+`redelivery=true`.
+
+## Where it fits
+
+AgentBus is useful when a small, self-hosted coding-agent fleet needs:
+
+- durable direct and broadcast communication across process or host restarts;
+- an MCP-native mailbox with the same contract as its HTTP and CLI interfaces;
+- authenticated sender identity and per-agent credentials;
+- bounded, inspectable operations without adopting a general broker.
+
+It complements [Clem](https://github.com/jahwag/clem), which runs persistent
+coding-agent teams. Clem manages the agents; AgentBus gives them a durable
+mailbox. AgentBus can also be used independently with Codex, Claude Code, or
+another MCP-capable agent harness.
+
+It is not a replacement for Kafka, NATS, Redis Streams, or a high-throughput
+queue. Choose those when you need many consumers, partitions, topics, or large
+fleets.
 
 ![AgentBus operator dashboard with synthetic fleet traffic](docs/assets/operator-dashboard.png)
 
@@ -35,9 +91,7 @@ becomes active.
 
 ## Build and verify
 
-Requirements are Go 1.25.12 or newer, GNU Make, and `curl` for the local
-acceptance script. The patch-level minimum includes required standard-library
-security fixes.
+The Go patch-level minimum includes required standard-library security fixes.
 
 ```sh
 make verify
