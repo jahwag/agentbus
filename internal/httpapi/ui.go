@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,20 @@ type uiLoginView struct {
 	Error string
 }
 
+type uiConversationMessage struct {
+	bus.Message
+	Data        string
+	CanReply    bool
+	ReplyTarget string
+	CommandID   string
+}
+
+type uiConversationView struct {
+	Messages      []uiConversationMessage
+	MissingParent string
+	Truncated     bool
+}
+
 const (
 	uiBootstrapTTL  = 2 * time.Minute
 	uiSessionTTL    = 8 * time.Hour
@@ -44,9 +59,14 @@ type uiCredentialStore struct {
 	mu       sync.Mutex
 	randomMu sync.Mutex
 	codes    map[[sha256.Size]byte]time.Time
-	sessions map[[sha256.Size]byte]time.Time
+	sessions map[[sha256.Size]byte]uiSession
 	now      func() time.Time
 	random   io.Reader
+}
+
+type uiSession struct {
+	ExpiresAt time.Time
+	Principal *bus.AuthenticatedPrincipal
 }
 
 func (s *Server) newUICredentialStore() *uiCredentialStore {
@@ -60,7 +80,7 @@ func (s *Server) newUICredentialStore() *uiCredentialStore {
 	}
 	return &uiCredentialStore{
 		codes:    make(map[[sha256.Size]byte]time.Time),
-		sessions: make(map[[sha256.Size]byte]time.Time),
+		sessions: make(map[[sha256.Size]byte]uiSession),
 		now:      now,
 		random:   random,
 	}
@@ -124,21 +144,59 @@ func (s *uiCredentialStore) exchangeCode(code, oldSession string) (string, error
 	if oldSession != "" {
 		delete(s.sessions, oldHash)
 	}
-	s.sessions[sessionHash] = now.Add(uiSessionTTL)
+	s.sessions[sessionHash] = uiSession{ExpiresAt: now.Add(uiSessionTTL)}
 	return session, nil
 }
 
-func (s *uiCredentialStore) validSession(session string) bool {
-	if session == "" {
-		return false
+func (s *uiCredentialStore) mintPrincipalSession(
+	principal bus.AuthenticatedPrincipal,
+	oldSession string,
+) (string, uiSession, error) {
+	raw := make([]byte, 32)
+	s.randomMu.Lock()
+	_, randomErr := io.ReadFull(s.random, raw)
+	s.randomMu.Unlock()
+	if randomErr != nil {
+		return "", uiSession{}, randomErr
 	}
-	hash := sha256.Sum256([]byte(session))
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256.Sum256([]byte(token))
+	oldHash := sha256.Sum256([]byte(oldSession))
+	now := s.now()
+	expiry := now.Add(uiSessionTTL)
+	if !principal.ExpiresAt.IsZero() && principal.ExpiresAt.Before(expiry) {
+		expiry = principal.ExpiresAt
+	}
+	if !expiry.After(now) {
+		return "", uiSession{}, errors.New("expired operator assertion")
+	}
+	session := uiSession{ExpiresAt: expiry, Principal: &principal}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	_, replacing := s.sessions[oldHash]
+	if len(s.sessions) >= maxUISessions && !replacing {
+		return "", uiSession{}, errUICapacity
+	}
+	if oldSession != "" {
+		delete(s.sessions, oldHash)
+	}
+	s.sessions[hash] = session
+	return token, session, nil
+}
+
+func (s *uiCredentialStore) session(token string) (uiSession, bool) {
+	if token == "" {
+		return uiSession{}, false
+	}
+	hash := sha256.Sum256([]byte(token))
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
-	expiry, ok := s.sessions[hash]
-	return ok && expiry.After(now)
+	session, ok := s.sessions[hash]
+	return session, ok && session.ExpiresAt.After(now)
 }
 
 func (s *uiCredentialStore) revokeSession(session string) {
@@ -157,8 +215,8 @@ func (s *uiCredentialStore) cleanupLocked(now time.Time) {
 			delete(s.codes, hash)
 		}
 	}
-	for hash, expiry := range s.sessions {
-		if !expiry.After(now) {
+	for hash, session := range s.sessions {
+		if !session.ExpiresAt.After(now) {
 			delete(s.sessions, hash)
 		}
 	}
@@ -194,7 +252,7 @@ func (s *Server) handleUILogin(store *uiCredentialStore) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		if !sameOriginUIRequest(r) {
+		if !s.sameOriginUIRequest(r) {
 			writeError(w, http.StatusForbidden, errors.New("UI login refused"))
 			return
 		}
@@ -217,10 +275,7 @@ func (s *Server) handleUILogin(store *uiCredentialStore) http.HandlerFunc {
 			})
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name: uiSessionCookie, Value: session, Path: "/ui", HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		s.setUISessionCookie(w, session)
 		w.Header().Set("Location", "/ui/")
 		w.WriteHeader(http.StatusSeeOther)
 	}
@@ -244,22 +299,46 @@ func (s *Server) handleUIDashboard(store *uiCredentialStore) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		cookie, err := r.Cookie(uiSessionCookie)
-		if err != nil || !store.validSession(cookie.Value) {
-			if err == nil {
-				clearUISessionCookie(w)
-			}
+		session, ok := s.authenticateUIRequest(w, r, store)
+		if !ok {
 			renderUITemplate(w, http.StatusOK, "login.html", uiLoginView{})
 			return
 		}
-
-		beforeSeq, ok := parseUIBeforeSeq(w, r)
-		if !ok {
+		if len(r.URL.Query()) != 0 {
+			writeError(w, http.StatusBadRequest, errors.New("invalid overview query"))
 			return
 		}
 		activity, err := s.Bus.Activity()
 		if err != nil {
 			writeBusError(w, err)
+			return
+		}
+		view := struct {
+			Activity bus.ActivityReport
+			Operator string
+			CanSend  bool
+		}{Activity: activity}
+		if session.Principal != nil {
+			view.Operator = session.Principal.Name
+			view.CanSend = true
+		}
+		renderUITemplate(w, http.StatusOK, "dashboard.html", view)
+	}
+}
+
+func (s *Server) handleUIMessages(store *uiCredentialStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.uiAvailable(r) {
+			http.NotFound(w, r)
+			return
+		}
+		session, ok := s.authenticateUIRequest(w, r, store)
+		if !ok {
+			renderUITemplate(w, http.StatusOK, "login.html", uiLoginView{})
+			return
+		}
+		beforeSeq, ok := parseUIBeforeSeq(w, r)
+		if !ok {
 			return
 		}
 		const pageSize = 50
@@ -268,18 +347,35 @@ func (s *Server) handleUIDashboard(store *uiCredentialStore) http.HandlerFunc {
 			writeBusError(w, err)
 			return
 		}
+		roster, err := s.Bus.Roster()
+		if err != nil {
+			writeBusError(w, err)
+			return
+		}
 		view := struct {
-			Activity   bus.ActivityReport
 			Routes     []bus.RecentRoute
+			Roster     []bus.RosterEntry
 			HasOlder   bool
 			NextBefore int64
-		}{Activity: activity, Routes: routes}
+			Operator   string
+			CanSend    bool
+			CommandID  string
+		}{Routes: routes, Roster: roster}
+		if session.Principal != nil {
+			view.Operator = session.Principal.Name
+			view.CanSend = true
+			view.CommandID, err = store.newClientMessageID()
+			if err != nil {
+				writeBusError(w, err)
+				return
+			}
+		}
 		if len(view.Routes) > pageSize {
 			view.Routes = view.Routes[:pageSize]
 			view.HasOlder = true
 			view.NextBefore = view.Routes[len(view.Routes)-1].Seq
 		}
-		renderUITemplate(w, http.StatusOK, "dashboard.html", view)
+		renderUITemplate(w, http.StatusOK, "messages.html", view)
 	}
 }
 
@@ -304,12 +400,11 @@ func (s *Server) handleUIReveal(store *uiCredentialStore) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		if !sameOriginUIRequest(r) {
+		if !s.sameOriginUIRequest(r) {
 			writeError(w, http.StatusForbidden, errors.New("UI reveal refused"))
 			return
 		}
-		cookie, err := r.Cookie(uiSessionCookie)
-		if err != nil || !store.validSession(cookie.Value) {
+		if _, ok := s.authenticateUIRequest(w, r, store); !ok {
 			writeError(w, http.StatusUnauthorized, errors.New("UI session required"))
 			return
 		}
@@ -334,27 +429,229 @@ func (s *Server) handleUIReveal(store *uiCredentialStore) http.HandlerFunc {
 	}
 }
 
+func (s *Server) handleUIConversation(store *uiCredentialStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.uiAvailable(r) {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.sameOriginUIRequest(r) {
+			writeError(w, http.StatusForbidden, errors.New("UI conversation refused"))
+			return
+		}
+		session, ok := s.authenticateUIRequest(w, r, store)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, errors.New("UI session required"))
+			return
+		}
+		form, ok := readUIForm(w, r, "message_id")
+		if !ok {
+			return
+		}
+		conversation, err := s.Bus.Conversation(form.Get("message_id"), 100)
+		if errors.Is(err, bus.ErrMessageNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("retained conversation not found"))
+			return
+		}
+		if err != nil {
+			writeBusError(w, err)
+			return
+		}
+		view := struct {
+			Conversation uiConversationView
+			Operator     string
+		}{
+			Conversation: uiConversationView{
+				MissingParent: conversation.MissingParent,
+				Truncated:     conversation.Truncated,
+				Messages:      make([]uiConversationMessage, 0, len(conversation.Messages)),
+			},
+		}
+		if session.Principal != nil {
+			view.Operator = session.Principal.Name
+		}
+		for _, message := range conversation.Messages {
+			messageView := uiConversationMessage{
+				Message: message,
+				Data:    string(message.Data),
+			}
+			if view.Operator != "" {
+				messageView.CanReply = true
+				messageView.ReplyTarget = message.From
+				if message.From == view.Operator {
+					messageView.ReplyTarget = message.To
+				}
+				messageView.CommandID, err = store.newClientMessageID()
+				if err != nil {
+					writeBusError(w, err)
+					return
+				}
+			}
+			view.Conversation.Messages = append(view.Conversation.Messages, messageView)
+		}
+		renderUITemplate(w, http.StatusOK, "conversation.html", view)
+	}
+}
+
+func (s *Server) handleUISend(store *uiCredentialStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.uiAvailable(r) {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.sameOriginUIRequest(r) {
+			writeError(w, http.StatusForbidden, errors.New("UI send refused"))
+			return
+		}
+		session, ok := s.authenticateUIRequest(w, r, store)
+		if !ok || session.Principal == nil || session.Principal.Kind != "operator" {
+			writeError(w, http.StatusForbidden, errors.New("externally authenticated operator session required"))
+			return
+		}
+		form, ok := readUIFormWithLimit(
+			w, r, maxRequestBytes, "to", "body", "reply_to", "client_message_id",
+		)
+		if !ok {
+			return
+		}
+		if form.Get("to") == "*" {
+			writeError(w, http.StatusBadRequest, errors.New("operator broadcast is not allowed"))
+			return
+		}
+		clientID := form.Get("client_message_id")
+		if !validUIClientMessageID(clientID) {
+			writeError(w, http.StatusBadRequest, errors.New("invalid UI command identifier"))
+			return
+		}
+		var replyTo *string
+		if raw := strings.TrimSpace(form.Get("reply_to")); raw != "" {
+			replyTo = &raw
+		}
+		_, err := s.Bus.SendAsOperator(*session.Principal, form.Get("to"), bus.SendOpts{
+			Body:            form.Get("body"),
+			ReplyTo:         replyTo,
+			ClientMessageID: clientID,
+		})
+		if err != nil {
+			writeBusError(w, err)
+			return
+		}
+		w.Header().Set("Location", "/ui/messages")
+		w.WriteHeader(http.StatusSeeOther)
+	}
+}
+
 func (s *Server) handleUILogout(store *uiCredentialStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.uiAvailable(r) {
 			http.NotFound(w, r)
 			return
 		}
-		if !sameOriginUIRequest(r) {
+		if !s.sameOriginUIRequest(r) {
 			writeError(w, http.StatusForbidden, errors.New("UI logout refused"))
 			return
 		}
 		if cookie, err := r.Cookie(uiSessionCookie); err == nil {
 			store.revokeSession(cookie.Value)
 		}
-		clearUISessionCookie(w)
+		s.clearUISessionCookie(w)
+		if s.UIAssertionVerifier != nil {
+			if s.UILogoutURL != "" {
+				w.Header().Set("Location", s.UILogoutURL)
+				w.WriteHeader(http.StatusSeeOther)
+				return
+			}
+			renderUITemplate(w, http.StatusOK, "logout.html", struct{}{})
+			return
+		}
 		w.Header().Set("Location", "/ui/")
 		w.WriteHeader(http.StatusSeeOther)
 	}
 }
 
 func (s *Server) uiAvailable(r *http.Request) bool {
-	return s.authEnabled() && loopbackHost(r.Host)
+	if !s.authEnabled() && s.UIAssertionVerifier == nil {
+		return false
+	}
+	if s.UIPublicOrigin == "" {
+		return loopbackHost(r.Host)
+	}
+	origin, err := url.Parse(s.UIPublicOrigin)
+	return err == nil && origin.Scheme != "" && origin.Host != "" &&
+		origin.Path == "" && r.Host == origin.Host
+}
+
+func (s *Server) authenticateUIRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	store *uiCredentialStore,
+) (uiSession, bool) {
+	oldSession := ""
+	if cookie, err := r.Cookie(uiSessionCookie); err == nil {
+		oldSession = cookie.Value
+		if session, ok := store.session(cookie.Value); ok {
+			if session.Principal == nil {
+				return session, true
+			}
+			if session.Principal.Kind == "operator" &&
+				s.Bus.ValidatePrincipal(*session.Principal) == nil {
+				return session, true
+			}
+			store.revokeSession(cookie.Value)
+			s.clearUISessionCookie(w)
+		}
+	}
+	if s.UIAssertionVerifier == nil {
+		return uiSession{}, false
+	}
+	header := s.UIAssertionHeader
+	if header == "" {
+		header = "Cf-Access-Jwt-Assertion"
+	}
+	raw := strings.TrimSpace(r.Header.Get(header))
+	if raw == "" {
+		return uiSession{}, false
+	}
+	assertion, err := s.UIAssertionVerifier.Verify(r.Context(), raw)
+	if err != nil {
+		return uiSession{}, false
+	}
+	principal, err := s.Bus.AuthenticateExternal(
+		assertion.Issuer,
+		assertion.Subject,
+		assertion.ExpiresAt,
+	)
+	if err != nil || principal.Kind != "operator" {
+		return uiSession{}, false
+	}
+	token, session, err := store.mintPrincipalSession(principal, oldSession)
+	if err != nil {
+		return uiSession{}, false
+	}
+	s.setUISessionCookie(w, token)
+	return session, true
+}
+
+func (s *uiCredentialStore) newClientMessageID() (string, error) {
+	raw := make([]byte, 16)
+	s.randomMu.Lock()
+	_, err := io.ReadFull(s.random, raw)
+	s.randomMu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return "operator-ui-" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func validUIClientMessageID(value string) bool {
+	const prefix = "operator-ui-"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, prefix)
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	return err == nil && len(raw) == 16 &&
+		base64.RawURLEncoding.EncodeToString(raw) == encoded
 }
 
 func parseUIBeforeSeq(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -388,21 +685,41 @@ func renderUITemplate(w http.ResponseWriter, status int, name string, data any) 
 	_, _ = w.Write(rendered.Bytes())
 }
 
-func clearUISessionCookie(w http.ResponseWriter) {
+func (s *Server) setUISessionCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, &http.Cookie{
-		Name: uiSessionCookie, Value: "", Path: "/ui", HttpOnly: true,
-		SameSite: http.SameSiteStrictMode, MaxAge: -1,
+		Name: uiSessionCookie, Value: value, Path: "/ui", HttpOnly: true,
+		Secure: s.uiCookieSecure(), SameSite: http.SameSiteStrictMode,
 	})
 }
 
-func sameOriginUIRequest(r *http.Request) bool {
-	if !loopbackHost(r.Host) {
+func (s *Server) clearUISessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: uiSessionCookie, Value: "", Path: "/ui", HttpOnly: true,
+		Secure: s.uiCookieSecure(), SameSite: http.SameSiteStrictMode, MaxAge: -1,
+	})
+}
+
+func (s *Server) uiCookieSecure() bool {
+	if s.UIPublicOrigin == "" {
 		return false
 	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
+	origin, err := url.Parse(s.UIPublicOrigin)
+	return err == nil && origin.Scheme == "https"
+}
+
+func (s *Server) sameOriginUIRequest(r *http.Request) bool {
+	if !s.uiAvailable(r) {
+		return false
 	}
+	expectedOrigin := s.UIPublicOrigin
+	if expectedOrigin == "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		expectedOrigin = scheme + "://" + r.Host
+	}
+	expectedOrigin = strings.TrimSuffix(expectedOrigin, "/")
 	origin := r.Header.Get("Origin")
 	fetchSite := r.Header.Get("Sec-Fetch-Site")
 	fetchMode := r.Header.Get("Sec-Fetch-Mode")
@@ -410,19 +727,28 @@ func sameOriginUIRequest(r *http.Request) bool {
 	fetchPresent := fetchSite != "" || fetchMode != "" || fetchDest != ""
 	fetchSameOriginNavigation := fetchSite == "same-origin" &&
 		fetchMode == "navigate" && fetchDest == "document"
-	if origin == scheme+"://"+r.Host {
+	if origin == expectedOrigin {
 		return !fetchPresent || fetchSameOriginNavigation
 	}
 	return (origin == "" || origin == "null") && fetchSameOriginNavigation
 }
 
 func readUIForm(w http.ResponseWriter, r *http.Request, allowedFields ...string) (mapForm, bool) {
+	return readUIFormWithLimit(w, r, 4096, allowedFields...)
+}
+
+func readUIFormWithLimit(
+	w http.ResponseWriter,
+	r *http.Request,
+	maxBytes int64,
+	allowedFields ...string,
+) (mapForm, bool) {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/x-www-form-urlencoded" {
 		writeError(w, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/x-www-form-urlencoded"))
 		return nil, false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	if err := r.ParseForm(); err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("invalid UI form"))
 		return nil, false

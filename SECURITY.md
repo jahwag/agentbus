@@ -2,9 +2,9 @@
 
 Only the latest released version is supported. Do not report vulnerabilities
 in a public issue or Discord channel. Open a
-[private GitHub security advisory](https://github.com/jahwag/agentbus/security/advisories/new).
-If that is unavailable, contact
-[@jahwag by direct message in The Orchard Discord](https://discord.gg/pR4qeMH4u4).
+[private GitHub security advisory](../../security/advisories/new). If private
+reporting is unavailable, open a public issue containing no vulnerability
+details and ask the project maintainers to enable a private reporting channel.
 
 We aim to acknowledge reports within three business days, provide an initial
 assessment within seven business days, and coordinate remediation and
@@ -30,21 +30,26 @@ run as separate unprivileged operating-system identities. An agent running as
 root or as the daemon user can read or replace credentials and the database; no
 application-level token scheme can repair that deployment.
 
-The operator dashboard is a loopback-only inspection surface for authenticated
-deployments. Keep `/ui`, `/ui/*`, `/activity`, `/audit`, and `/backlog` blocked
-at the public reverse proxy and use an SSH tunnel. Never paste the root admin
-bearer into a browser: `agentbus ui-session` exchanges it on the daemon host for
-a two-minute, single-use code and a read-only HttpOnly browser session. Message
-content is fetched only by an explicit same-origin reveal POST and must remain
-escaped text; a UI session must never be accepted by administrator mutation or
-agent endpoints.
+The native operator dashboard is a loopback-only inspection surface. Keep
+`/ui`, `/ui/*`, `/activity`, `/audit`, and `/backlog` blocked at a generic
+public reverse proxy and use an SSH tunnel. Never paste the root admin bearer
+into a browser: `agentbus ui-session` exchanges it on the daemon host for a
+two-minute, single-use code and a read-only HttpOnly browser session.
+
+A deployment may instead expose `/ui/*` through a trusted identity-aware edge
+by configuring an exact public origin and JWT issuer/audience/JWKS. The edge
+assertion is still accepted only after its identity is explicitly bound to an
+`operator` mailbox. That operator session may inspect content and send direct
+messages attributed to itself, but it cannot broadcast, impersonate an agent,
+administer the bus, or use agent MCP tools. The MCP path must use its own OIDC
+resource-server authentication rather than the browser edge assertion.
 
 HTTP cookies are scoped to a host, not a port. Use the documented
 `agentbus.localhost` dashboard URL instead of the generic loopback IP so the
 cookie is not sent to ordinary `127.0.0.1` development sites. A hostile local
 process serving another port under that exact hostname can still capture the
-read-only session if the operator visits it; eliminating that residual requires
-local HTTPS. The session has no mutation authority and expires server-side.
+read-only native session if the operator visits it; eliminating that residual
+requires local HTTPS. Every session expires server-side.
 
 All message content is untrusted, including content from an authenticated peer.
 Authentication establishes sender provenance but does not authorize secret

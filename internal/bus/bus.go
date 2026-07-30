@@ -33,6 +33,10 @@ var (
 	ErrRetiredIdentity        = errors.New("agentbus: mailbox is retired")
 	ErrUnknownMessage         = errors.New("agentbus: message is not pending for this mailbox")
 	ErrBadToken               = errors.New("agentbus: invalid token")
+	ErrInvalidPrincipalKind   = errors.New("agentbus: principal kind must be agent or operator")
+	ErrPrincipalKindConflict  = errors.New("agentbus: mailbox principal kind cannot be changed")
+	ErrInvalidExternalID      = errors.New("agentbus: external issuer and subject are required")
+	ErrExternalIdentityInUse  = errors.New("agentbus: external identity is already bound")
 	ErrInvalidClientMessageID = errors.New("agentbus: client_message_id is required and must not exceed 200 bytes")
 	ErrIdempotencyConflict    = errors.New("agentbus: client_message_id reused with different send input")
 	ErrInvalidData            = errors.New("agentbus: data must be valid JSON with depth at most 32")
@@ -68,6 +72,7 @@ const (
 	maxAuditReasonBytes               = 1024
 	maxActivityMailboxes              = 256
 	maxRecentRoutes                   = 100
+	maxConversationMessages           = 100
 )
 
 const schema = `
@@ -221,6 +226,19 @@ AFTER UPDATE OF state, attempts ON receipts BEGIN
 END;`},
 	{version: 4, sql: `
 CREATE INDEX receipts_message_seq_state ON receipts(message_seq, state);`},
+	{version: 5, sql: `
+ALTER TABLE mailboxes
+	ADD COLUMN principal_kind TEXT NOT NULL DEFAULT 'agent'
+	CHECK(principal_kind IN ('agent','operator'));
+
+CREATE TABLE external_identities(
+	issuer TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	mailbox_name TEXT NOT NULL REFERENCES mailboxes(name) ON DELETE CASCADE,
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+	PRIMARY KEY(issuer, subject),
+	UNIQUE(mailbox_name, issuer)
+);`},
 }
 
 type Message struct {
@@ -254,7 +272,9 @@ type SendOpts struct {
 // parked and validate it immediately before exposing a delivery.
 type AuthenticatedPrincipal struct {
 	Name       string
+	Kind       string
 	Generation int64
+	ExpiresAt  time.Time
 }
 
 type PruneResult struct {
@@ -317,6 +337,14 @@ type ReceiptStateCounts struct {
 	Offered int64 `json:"offered"`
 	Acked   int64 `json:"acked"`
 	Dead    int64 `json:"dead"`
+}
+
+// Conversation is one bounded retained reply tree. MissingParent is set when
+// the oldest retained message replies to content that has already been pruned.
+type Conversation struct {
+	Messages      []Message `json:"messages"`
+	MissingParent string    `json:"missing_parent,omitempty"`
+	Truncated     bool      `json:"truncated"`
 }
 
 type backlogLimits struct {
@@ -502,6 +530,24 @@ func (b *Bus) Close() error {
 }
 
 func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
+	return b.send(from, to, opts, nil)
+}
+
+// SendAsOperator sends one direct message attributed to an externally bound
+// operator. The principal snapshot is revalidated in the send transaction,
+// and a body-free audit event is committed atomically with the message.
+func (b *Bus) SendAsOperator(principal AuthenticatedPrincipal, to string, opts SendOpts) (_ Message, err error) {
+	if principal.Kind != "operator" {
+		return Message{}, ErrBadToken
+	}
+	if to == "*" {
+		return Message{}, ErrInvalidName
+	}
+	opts.AllowNew = false
+	return b.send(principal.Name, to, opts, &principal)
+}
+
+func (b *Bus) send(from, to string, opts SendOpts, operator *AuthenticatedPrincipal) (_ Message, err error) {
 	defer func() { err = mapStorageError(err) }()
 	if !nameRE.MatchString(from) || (to != "*" && !nameRE.MatchString(to)) {
 		return Message{}, ErrInvalidName
@@ -531,6 +577,11 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 	}
 	defer tx.Rollback()
 
+	if operator != nil {
+		if err := validatePrincipalTx(tx, *operator, "operator"); err != nil {
+			return Message{}, err
+		}
+	}
 	if err := activateMailbox(tx, from); err != nil {
 		return Message{}, err
 	}
@@ -583,8 +634,13 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 		return Message{}, err
 	}
 
+	recipientKind := ""
 	if to != "*" {
-		state, err := mailboxState(tx, to)
+		var state string
+		err := tx.QueryRow(
+			`SELECT state, principal_kind FROM mailboxes WHERE name = ?`,
+			to,
+		).Scan(&state, &recipientKind)
 		switch {
 		case errors.Is(err, sql.ErrNoRows) && opts.AllowNew:
 			var reserved int
@@ -597,12 +653,15 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 			if _, err := tx.Exec(`INSERT INTO mailboxes(name, state) VALUES(?, 'reserved')`, to); err != nil {
 				return Message{}, err
 			}
+			recipientKind = "agent"
 		case errors.Is(err, sql.ErrNoRows):
 			return Message{}, ErrUnknownRecipient
 		case err != nil:
 			return Message{}, err
 		case state == "retired":
 			return Message{}, ErrRetiredIdentity
+		case operator != nil && recipientKind != "agent":
+			return Message{}, ErrUnknownRecipient
 		}
 	}
 	recipients := []string{to}
@@ -611,6 +670,11 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 		if err != nil {
 			return Message{}, err
 		}
+	}
+	if recipientKind == "operator" {
+		// Agent replies are visible in the operator conversation without
+		// creating an inbox item that no agent consumer can acknowledge.
+		recipients = nil
 	}
 	if err := b.requireBacklogCapacity(tx, recipients, messageBytes); err != nil {
 		return Message{}, err
@@ -641,7 +705,9 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 	}
 	for _, recipient := range recipients {
 		if _, err := tx.Exec(
-			`INSERT INTO receipts(mailbox_name, message_seq, state) VALUES(?,?,'pending')`, recipient, seq); err != nil {
+			`INSERT INTO receipts(mailbox_name, message_seq, state) VALUES(?,?,'pending')`,
+			recipient, seq,
+		); err != nil {
 			return Message{}, err
 		}
 	}
@@ -655,10 +721,21 @@ func (b *Bus) Send(from, to string, opts SendOpts) (_ Message, err error) {
 		from, opts.ClientMessageID, commandHash, m.MessageID, m.Seq, m.TS, m.To); err != nil {
 		return Message{}, err
 	}
+	if operator != nil {
+		if _, err := tx.Exec(
+			`INSERT INTO audit_events(action,mailbox_name,message_id,sender_name,reason)
+			 VALUES('operator_send',?,?,?,'operator sent direct message')`,
+			to, m.MessageID, from,
+		); err != nil {
+			return Message{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Message{}, err
 	}
-	b.wake(to)
+	if len(recipients) > 0 {
+		b.wake(to)
+	}
 	return m, nil
 }
 func mapStorageError(err error) error {
@@ -674,7 +751,11 @@ func mapStorageError(err error) error {
 
 func activeBroadcastRecipients(tx *sql.Tx, from string) ([]string, error) {
 	rows, err := tx.Query(
-		`SELECT name FROM mailboxes WHERE state = 'active' AND name != ? ORDER BY name`, from)
+		`SELECT name FROM mailboxes
+		 WHERE state = 'active' AND principal_kind = 'agent' AND name != ?
+		 ORDER BY name`,
+		from,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1182,8 +1263,12 @@ func (b *Bus) Mint(name string) (_ string, err error) {
 	}
 	defer tx.Rollback()
 	var state string
+	var kind string
 	var priorToken sql.NullString
-	err = tx.QueryRow(`SELECT state, token_hash FROM mailboxes WHERE name = ?`, name).Scan(&state, &priorToken)
+	err = tx.QueryRow(
+		`SELECT state, token_hash, principal_kind FROM mailboxes WHERE name = ?`,
+		name,
+	).Scan(&state, &priorToken, &kind)
 	action := "mint"
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -1194,6 +1279,8 @@ func (b *Bus) Mint(name string) (_ string, err error) {
 		return "", err
 	case state == "retired":
 		return "", ErrRetiredIdentity
+	case kind != "agent":
+		return "", ErrInvalidPrincipalKind
 	case state == "reserved":
 		if _, err := tx.Exec(`UPDATE mailboxes SET state = 'active' WHERE name = ?`, name); err != nil {
 			return "", err
@@ -1234,9 +1321,9 @@ func (b *Bus) Authenticate(token string) (string, error) {
 func (b *Bus) AuthenticatePrincipal(token string) (AuthenticatedPrincipal, error) {
 	var principal AuthenticatedPrincipal
 	err := b.db.QueryRow(
-		`SELECT name, credential_generation
+		`SELECT name, principal_kind, credential_generation
 		 FROM mailboxes WHERE token_hash = ? AND state = 'active'`,
-		hashToken(token)).Scan(&principal.Name, &principal.Generation)
+		hashToken(token)).Scan(&principal.Name, &principal.Kind, &principal.Generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthenticatedPrincipal{}, ErrBadToken
 	}
@@ -1247,15 +1334,181 @@ func (b *Bus) AuthenticatePrincipal(token string) (AuthenticatedPrincipal, error
 // generation is still active. It deliberately accepts no bearer token so raw
 // credentials cannot leak through parked-request state or tool output.
 func (b *Bus) ValidatePrincipal(principal AuthenticatedPrincipal) error {
+	if !principal.ExpiresAt.IsZero() && !principal.ExpiresAt.After(time.Now()) {
+		return ErrBadToken
+	}
+	return validatePrincipalQuerier(b.db, principal, "")
+}
+
+type principalQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func validatePrincipalTx(tx *sql.Tx, principal AuthenticatedPrincipal, requiredKind string) error {
+	if !principal.ExpiresAt.IsZero() && !principal.ExpiresAt.After(time.Now()) {
+		return ErrBadToken
+	}
+	return validatePrincipalQuerier(tx, principal, requiredKind)
+}
+
+func validatePrincipalQuerier(q principalQuerier, principal AuthenticatedPrincipal, requiredKind string) error {
+	query := `SELECT 1 FROM mailboxes
+		 WHERE name = ? AND credential_generation = ? AND state = 'active'`
+	args := []any{principal.Name, principal.Generation}
+	if requiredKind != "" {
+		query += ` AND principal_kind = ?`
+		args = append(args, requiredKind)
+	}
 	var exists int
-	err := b.db.QueryRow(
-		`SELECT 1 FROM mailboxes
-		 WHERE name = ? AND credential_generation = ? AND state = 'active'`,
-		principal.Name, principal.Generation).Scan(&exists)
+	err := q.QueryRow(query, args...).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrBadToken
 	}
 	return err
+}
+
+func (b *Bus) AuthenticateExternal(issuer, subject string, expiresAt time.Time) (AuthenticatedPrincipal, error) {
+	var principal AuthenticatedPrincipal
+	err := b.db.QueryRow(
+		`SELECT m.name, m.principal_kind, m.credential_generation
+		 FROM external_identities e
+		 JOIN mailboxes m ON m.name=e.mailbox_name
+		 WHERE e.issuer=? AND e.subject=? AND m.state='active'`,
+		issuer, subject,
+	).Scan(&principal.Name, &principal.Kind, &principal.Generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuthenticatedPrincipal{}, ErrBadToken
+	}
+	principal.ExpiresAt = expiresAt
+	return principal, err
+}
+
+func (b *Bus) BindExternalIdentity(name, kind, issuer, subject string) error {
+	if !nameRE.MatchString(name) {
+		return ErrInvalidName
+	}
+	if kind != "agent" && kind != "operator" {
+		return ErrInvalidPrincipalKind
+	}
+	issuer, subject = strings.TrimSpace(issuer), strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return ErrInvalidExternalID
+	}
+	tx, err := b.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state, existingKind string
+	var discardedReceipts int64
+	err = tx.QueryRow(
+		`SELECT state, principal_kind FROM mailboxes WHERE name=?`,
+		name,
+	).Scan(&state, &existingKind)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(
+			`INSERT INTO mailboxes(name,state,principal_kind,credential_generation)
+			 VALUES(?,'active',?,1)`,
+			name, kind,
+		); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	case state == "retired":
+		return ErrRetiredIdentity
+	case existingKind != kind && !(state == "reserved" && kind == "operator"):
+		return ErrPrincipalKindConflict
+	case state == "reserved" && kind == "operator":
+		result, err := tx.Exec(`DELETE FROM receipts WHERE mailbox_name=?`, name)
+		if err != nil {
+			return err
+		}
+		discardedReceipts, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE mailboxes
+			 SET state='active',
+			     principal_kind='operator',
+			     token_hash=NULL,
+			     credential_generation=credential_generation+1
+			 WHERE name=?`,
+			name,
+		); err != nil {
+			return err
+		}
+	default:
+		if _, err := tx.Exec(
+			`UPDATE mailboxes
+			 SET state=CASE WHEN state='reserved' THEN 'active' ELSE state END,
+			     token_hash=CASE WHEN principal_kind='operator' THEN NULL ELSE token_hash END,
+			     credential_generation=credential_generation+1
+			 WHERE name=?`,
+			name,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO external_identities(issuer,subject,mailbox_name) VALUES(?,?,?)`,
+		issuer, subject, name,
+	); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrExternalIdentityInUse
+		}
+		return err
+	}
+	reason := "external identity bound"
+	if discardedReceipts > 0 {
+		reason = fmt.Sprintf(
+			"reserved mailbox claimed as operator; discarded_receipts=%d",
+			discardedReceipts,
+		)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO audit_events(action,mailbox_name,reason) VALUES('bind_external_identity',?,?)`,
+		name, reason,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (b *Bus) UnbindExternalIdentity(issuer, subject string) error {
+	issuer, subject = strings.TrimSpace(issuer), strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return ErrInvalidExternalID
+	}
+	tx, err := b.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var name string
+	if err := tx.QueryRow(
+		`DELETE FROM external_identities WHERE issuer=? AND subject=? RETURNING mailbox_name`,
+		issuer, subject,
+	).Scan(&name); errors.Is(err, sql.ErrNoRows) {
+		return ErrBadToken
+	} else if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE mailboxes SET credential_generation=credential_generation+1 WHERE name=?`,
+		name,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO audit_events(action,mailbox_name,reason) VALUES('unbind_external_identity',?,'external identity unbound')`,
+		name,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type DeadLetter struct {
@@ -1556,9 +1809,106 @@ func (b *Bus) MessageContent(messageID string) (Message, error) {
 	return message, nil
 }
 
+// Conversation returns the retained reply tree containing messageID. It walks
+// to the oldest retained ancestor first, then loads descendants oldest-first.
+// Both walks are bounded so hostile or malformed reply graphs cannot turn one
+// operator request into an unbounded database traversal.
+func (b *Bus) Conversation(messageID string, limit int) (Conversation, error) {
+	if !messageIDRE.MatchString(messageID) {
+		return Conversation{}, ErrMessageNotFound
+	}
+	if limit < 1 || limit > maxConversationMessages {
+		return Conversation{}, ErrInvalidPagination
+	}
+
+	root := messageID
+	missingParent := ""
+	for depth := 0; depth < maxConversationMessages; depth++ {
+		var replyTo sql.NullString
+		err := b.db.QueryRow(
+			`SELECT reply_to FROM messages WHERE message_id=?`,
+			root,
+		).Scan(&replyTo)
+		if errors.Is(err, sql.ErrNoRows) {
+			if depth == 0 {
+				return Conversation{}, ErrMessageNotFound
+			}
+			missingParent = root
+			break
+		}
+		if err != nil {
+			return Conversation{}, err
+		}
+		if !replyTo.Valid {
+			break
+		}
+		var retained int
+		err = b.db.QueryRow(`SELECT 1 FROM messages WHERE message_id=?`, replyTo.String).Scan(&retained)
+		if errors.Is(err, sql.ErrNoRows) {
+			missingParent = replyTo.String
+			break
+		}
+		if err != nil {
+			return Conversation{}, err
+		}
+		root = replyTo.String
+	}
+
+	rows, err := b.db.Query(
+		`WITH RECURSIVE thread(message_id, depth) AS (
+			SELECT ?, 0
+			UNION ALL
+			SELECT m.message_id, thread.depth + 1
+			FROM messages m JOIN thread ON m.reply_to = thread.message_id
+			WHERE thread.depth < ?
+			LIMIT ?
+		)
+		SELECT m.seq, m.message_id, m.from_name, m.to_name, m.ts,
+		       m.body, m.data, m.reply_to
+		FROM thread JOIN messages m USING(message_id)
+		ORDER BY m.seq ASC LIMIT ?`,
+		root, maxConversationMessages, limit+1, limit+1,
+	)
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer rows.Close()
+
+	var conversation Conversation
+	conversation.MissingParent = missingParent
+	for rows.Next() {
+		var message Message
+		var data, replyTo sql.NullString
+		if err := rows.Scan(
+			&message.Seq, &message.MessageID, &message.From, &message.To, &message.TS,
+			&message.Body, &data, &replyTo,
+		); err != nil {
+			return Conversation{}, err
+		}
+		if data.Valid {
+			message.Data = json.RawMessage(data.String)
+		}
+		if replyTo.Valid {
+			message.ReplyTo = &replyTo.String
+		}
+		if len(conversation.Messages) == limit {
+			conversation.Truncated = true
+			continue
+		}
+		conversation.Messages = append(conversation.Messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return Conversation{}, err
+	}
+	return conversation, nil
+}
+
 func (b *Bus) Roster() ([]RosterEntry, error) {
 	rows, err := b.db.Query(
-		`SELECT name, COALESCE(last_seen, '') FROM mailboxes WHERE state = 'active' ORDER BY name`)
+		`SELECT name, COALESCE(last_seen, '') FROM mailboxes
+		 WHERE state = 'active' AND principal_kind = 'agent'
+		 ORDER BY name`,
+	)
 	if err != nil {
 		return nil, err
 	}

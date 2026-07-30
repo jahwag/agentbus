@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jahwag/agentbus/internal/bus"
+	"github.com/jahwag/agentbus/internal/oidcauth"
 )
 
 const (
@@ -39,14 +40,22 @@ type Server struct {
 	// and administrator HTTP interfaces unchanged. The zero value keeps the UI
 	// available in authenticated mode.
 	DisableUI bool
-	uiNow     func() time.Time
-	uiRandom  io.Reader
+	// UIAssertionVerifier enables trusted edge assertions, such as Cloudflare
+	// Access JWTs, for operator sessions. External identities still have to be
+	// explicitly bound to an operator mailbox in AgentBus.
+	UIAssertionVerifier *oidcauth.Verifier
+	UIAssertionHeader   string
+	UIPublicOrigin      string
+	UILogoutURL         string
+	uiNow               func() time.Time
+	uiRandom            io.Reader
 }
 
 type principalKey struct{}
 
 type principal struct {
 	Name                 string
+	Kind                 string
 	CredentialGeneration int64
 	Admin                bool
 }
@@ -74,6 +83,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			p.Name = authenticated.Name
+			p.Kind = authenticated.Kind
 			p.CredentialGeneration = authenticated.Generation
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
@@ -110,7 +120,7 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) requireAgent(next http.HandlerFunc) http.HandlerFunc {
 	return s.withAuth(func(w http.ResponseWriter, r *http.Request) {
 		if s.authEnabled() {
-			if p, ok := r.Context().Value(principalKey{}).(principal); !ok || p.Admin {
+			if p, ok := r.Context().Value(principalKey{}).(principal); !ok || p.Admin || p.Kind != "agent" {
 				writeError(w, http.StatusForbidden, errors.New("agent credential required"))
 				return
 			}
@@ -134,6 +144,18 @@ type ackRequest struct {
 	DeliveryID string `json:"delivery_id"`
 }
 
+type bindIdentityRequest struct {
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	Issuer  string `json:"issuer"`
+	Subject string `json:"subject"`
+}
+
+type unbindIdentityRequest struct {
+	Issuer  string `json:"issuer"`
+	Subject string `json:"subject"`
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /send", s.requireAgent(s.handleSend))
@@ -141,6 +163,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ack", s.requireAgent(s.handleAck))
 	mux.HandleFunc("GET /roster", s.withAuth(s.handleRoster))
 	mux.HandleFunc("POST /mint", s.requireAdmin(s.handleMint))
+	mux.HandleFunc("POST /bind-identity", s.requireAdmin(s.handleBindIdentity))
+	mux.HandleFunc("POST /unbind-identity", s.requireAdmin(s.handleUnbindIdentity))
 	mux.HandleFunc("POST /skip", s.requireAdmin(s.handleSkip))
 	mux.HandleFunc("POST /retire", s.requireAdmin(s.handleRetire))
 	mux.HandleFunc("POST /prune", s.requireAdmin(s.handlePrune))
@@ -153,8 +177,11 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /ui/login", s.handleUILogin(uiStore))
 		mux.HandleFunc("GET /ui", s.handleUIRoot)
 		mux.HandleFunc("GET /ui/", s.handleUIDashboard(uiStore))
+		mux.HandleFunc("GET /ui/messages", s.handleUIMessages(uiStore))
 		mux.HandleFunc("GET /ui/style.css", s.handleUIStyles)
 		mux.HandleFunc("POST /ui/reveal", s.handleUIReveal(uiStore))
+		mux.HandleFunc("POST /ui/conversation", s.handleUIConversation(uiStore))
+		mux.HandleFunc("POST /ui/send", s.handleUISend(uiStore))
 		mux.HandleFunc("POST /ui/logout", s.handleUILogout(uiStore))
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -290,6 +317,32 @@ func (s *Server) handleRoster(w http.ResponseWriter, _ *http.Request) {
 		entries = []bus.RosterEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleBindIdentity(w http.ResponseWriter, r *http.Request) {
+	var req bindIdentityRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.Bus.BindExternalIdentity(req.Name, req.Kind, req.Issuer, req.Subject); err != nil {
+		writeBusError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bound": true, "name": req.Name, "kind": req.Kind,
+	})
+}
+
+func (s *Server) handleUnbindIdentity(w http.ResponseWriter, r *http.Request) {
+	var req unbindIdentityRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.Bus.UnbindExternalIdentity(req.Issuer, req.Subject); err != nil {
+		writeBusError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"unbound": true})
 }
 
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +529,8 @@ func writeBusError(w http.ResponseWriter, err error) {
 	code := "internal_error"
 	switch {
 	case errors.Is(err, bus.ErrInvalidName),
+		errors.Is(err, bus.ErrInvalidPrincipalKind),
+		errors.Is(err, bus.ErrInvalidExternalID),
 		errors.Is(err, bus.ErrInvalidClientMessageID),
 		errors.Is(err, bus.ErrInvalidData),
 		errors.Is(err, bus.ErrInvalidReplyTo),
@@ -496,6 +551,12 @@ func writeBusError(w http.ResponseWriter, err error) {
 	case errors.Is(err, bus.ErrIdempotencyConflict):
 		status = http.StatusConflict
 		code = "idempotency_conflict"
+	case errors.Is(err, bus.ErrExternalIdentityInUse):
+		status = http.StatusConflict
+		code = "external_identity_in_use"
+	case errors.Is(err, bus.ErrPrincipalKindConflict):
+		status = http.StatusConflict
+		code = "principal_kind_conflict"
 	case errors.Is(err, bus.ErrRetiredIdentity):
 		status = http.StatusGone
 		code = "retired_identity"

@@ -205,7 +205,7 @@ for secret in "$admin_secret" "$ui_code" "$ui_cookie" 'UI_ACCEPTANCE_SECRET_'; d
 done
 unset admin_secret ui_code ui_cookie
 
-grep '@public path /send /wait /ack /roster /mcp /mcp/\* /healthz /readyz' deploy/Caddyfile.example >/dev/null
+grep '@public path /send /wait /ack /roster /mcp /mcp/\* /.well-known/oauth-protected-resource/mcp /healthz /readyz' deploy/Caddyfile.example >/dev/null
 grep 'respond "HTTPS required" 426' deploy/Caddyfile.example >/dev/null
 if grep '@public path .* /ui' deploy/Caddyfile.example >/dev/null; then
 	echo 'Caddy public allowlist exposed the operator UI' >&2

@@ -78,6 +78,13 @@ acknowledge only after processing succeeds.
 Broadcasts create an independent receipt for every intended recipient. One
 slow consumer does not block the others.
 
+Operator mailboxes are UI principals, not agent consumers: they never appear
+in the agent roster or receive `wait`/`ack` deliveries. A direct agent reply to
+an operator is retained in the conversation and recent-route views without a
+mailbox receipt, so it is visible in the chat UI but is not an at-least-once
+agent delivery. Normal retention pruning removes these records on the same
+schedule as other settled message history.
+
 ## Where it fits
 
 Use AgentBus when:
@@ -100,8 +107,9 @@ redelivery, acknowledgement, leases, and an operator audit trail.
   acknowledgement, roster lookup, and related coordination.
 - **CLI:** Administrative and mailbox commands through `bin/agentbus`.
 - **HTTP:** Health, readiness, mailbox, audit, and operator endpoints.
-- **Operator UI:** Capability-scoped inspection without exposing message bodies
-  in activity views.
+- **Operator UI:** Overview and message-conversation views with explicit
+  content reveal. Externally bound operators may send direct, attributed
+  messages; native administrator-code sessions remain inspection-only.
 
 Run the binaries with `--help` for the current command and configuration
 surface:
@@ -124,6 +132,46 @@ only. For shared hosts or networks:
 - keep the daemon on loopback or behind an authenticated TLS reverse proxy;
 - protect the SQLite database and token files with restrictive permissions;
 - never place tokens in command arguments, repository files, or logs.
+
+AgentBus can validate native agent tokens and OIDC workload access tokens at
+the same `/mcp` resource. OIDC mode uses provider discovery/JWKS and supports a
+stable `oid` subject plus a required application role:
+
+```text
+AGENTBUS_OIDC_ISSUER=https://identity.example.com/tenant/v2.0
+AGENTBUS_OIDC_AUDIENCE=EXPECTED_ACCESS_TOKEN_AUD
+AGENTBUS_OIDC_SUBJECT_CLAIM=oid
+AGENTBUS_OIDC_REQUIRED_ROLE=AgentBus.Agent
+AGENTBUS_MCP_RESOURCE_URI=https://agentbus.example.com/mcp
+```
+
+Bind each validated `(issuer, subject)` to one local mailbox with
+`agentbus bind-identity`. Operators and agents are separate principal kinds;
+operator identities cannot call agent MCP tools.
+
+For short-lived Entra client-credential tokens, run
+`agentbus-mcp-bridge` as the local stdio MCP process. It uses
+`DefaultAzureCredential`, caches and refreshes access tokens, and accepts
+`AGENTBUS_MCP_URL` plus `AGENTBUS_SCOPE` or `AGENTBUS_AUDIENCE`. A native
+`AGENTBUS_TOKEN` remains the portable fallback. The Entra path requires an
+explicit `AZURE_TOKEN_CREDENTIALS`; use `prod` for unattended services so the
+credential chain cannot fall through to a cached CLI/developer identity.
+
+For Entra v2 specifically, set the daemon's `AGENTBUS_OIDC_AUDIENCE` to the
+resource application's bare client-ID GUID because that is the access token's
+`aud`. The bridge's token-request audience remains
+`api://RESOURCE_APP_ID` (or use the explicit
+`api://RESOURCE_APP_ID/.default` scope).
+
+The browser UI supports trusted-edge assertion exchange without making that
+edge the MCP authorization server. Configure `AGENTBUS_UI_ASSERTION_ISSUER`,
+`AGENTBUS_UI_ASSERTION_AUDIENCE`, `AGENTBUS_UI_ASSERTION_JWKS_URL`, and
+`AGENTBUS_UI_PUBLIC_ORIGIN`; then bind the assertion identity to an `operator`
+mailbox. Set `AGENTBUS_UI_LOGOUT_URL` to the edge provider's HTTPS logout
+endpoint so ending the product session also ends the upstream session instead
+of immediately exchanging the still-valid assertion again. Deployments
+without a trusted edge can keep using the loopback one-time administrator code
+for read-only inspection.
 
 Read [SECURITY.md](SECURITY.md) before exposing AgentBus beyond a trusted local
 machine. Operational defaults and recovery procedures live in

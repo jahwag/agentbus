@@ -40,7 +40,9 @@ Agent commands:
   roster   list active mailboxes
 
 Admin commands:
-  mint     mint or rotate an identity into a protected token file
+mint     mint or rotate an identity into a protected token file
+bind-identity bind an OIDC issuer/subject to an agent or operator mailbox
+unbind-identity remove an OIDC issuer/subject binding
   skip     dead-letter one poison receipt with an audit reason
   retire   retire a mailbox with an audit reason
   prune    prune terminal mail using a retention or explicit cutoff
@@ -198,6 +200,56 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 		_, err = requestJSON(ctx, client, http.MethodPost, strings.TrimRight(*server, "/")+"/retire", adminToken,
 			map[string]string{"name": *name, "reason": *reason})
 		return err
+	case "bind-identity":
+		fs := flag.NewFlagSet("bind-identity", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		server := fs.String("server", "http://127.0.0.1:7777", "AgentBus base URL")
+		adminTokenFile := fs.String("admin-token-file", os.Getenv("AGENTBUS_ADMIN_TOKEN_FILE"), "administrator token file")
+		name := fs.String("name", "", "mailbox name")
+		kind := fs.String("kind", "", "agent or operator")
+		issuer := fs.String("issuer", "", "OIDC issuer")
+		subject := fs.String("subject", "", "OIDC subject")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *name == "" || *kind == "" || *issuer == "" || *subject == "" || *adminTokenFile == "" {
+			return errors.New("bind-identity requires --name, --kind, --issuer, --subject, and --admin-token-file")
+		}
+		adminToken, err := readTokenFile(*adminTokenFile)
+		if err != nil {
+			return err
+		}
+		out, err := requestJSON(ctx, client, http.MethodPost, strings.TrimRight(*server, "/")+"/bind-identity", adminToken, map[string]string{
+			"name": *name, "kind": *kind, "issuer": *issuer, "subject": *subject,
+		})
+		if err != nil {
+			return err
+		}
+		return writeOutput(stdout, out)
+	case "unbind-identity":
+		fs := flag.NewFlagSet("unbind-identity", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		server := fs.String("server", "http://127.0.0.1:7777", "AgentBus base URL")
+		adminTokenFile := fs.String("admin-token-file", os.Getenv("AGENTBUS_ADMIN_TOKEN_FILE"), "administrator token file")
+		issuer := fs.String("issuer", "", "OIDC issuer")
+		subject := fs.String("subject", "", "OIDC subject")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *issuer == "" || *subject == "" || *adminTokenFile == "" {
+			return errors.New("unbind-identity requires --issuer, --subject, and --admin-token-file")
+		}
+		adminToken, err := readTokenFile(*adminTokenFile)
+		if err != nil {
+			return err
+		}
+		out, err := requestJSON(ctx, client, http.MethodPost, strings.TrimRight(*server, "/")+"/unbind-identity", adminToken, map[string]string{
+			"issuer": *issuer, "subject": *subject,
+		})
+		if err != nil {
+			return err
+		}
+		return writeOutput(stdout, out)
 	case "mint":
 		fs := flag.NewFlagSet("mint", flag.ContinueOnError)
 		fs.SetOutput(stderr)

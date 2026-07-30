@@ -94,6 +94,62 @@ func TestUISessionUsesAdminCredentialWithoutPrintingIt(t *testing.T) {
 	}
 }
 
+func TestBindAndUnbindIdentityUseEveryDocumentedFlag(t *testing.T) {
+	adminFile := filepath.Join(t.TempDir(), "admin.token")
+	if err := os.WriteFile(adminFile, []byte("admin-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.Header.Get("Authorization"); got != "Bearer admin-secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		switch r.URL.Path {
+		case "/bind-identity":
+			if body["name"] != "worker" || body["kind"] != "agent" ||
+				body["issuer"] != "https://id.example" || body["subject"] != "object-1" {
+				t.Fatalf("bind body = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"bound":true}`))
+		case "/unbind-identity":
+			if len(body) != 2 || body["issuer"] != "https://id.example" ||
+				body["subject"] != "object-1" {
+				t.Fatalf("unbind body = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"unbound":true}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	for _, args := range [][]string{
+		{
+			"bind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
+			"--name", "worker", "--kind", "agent",
+			"--issuer", "https://id.example", "--subject", "object-1",
+		},
+		{
+			"unbind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
+			"--issuer", "https://id.example", "--subject", "object-1",
+		},
+	} {
+		if err := execute(
+			context.Background(), args, io.Discard, io.Discard, ts.Client(),
+		); err != nil {
+			t.Fatalf("%s: %v", args[0], err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("identity API calls = %d", calls)
+	}
+}
+
 func TestSendCarriesStructuredPayloadAndPrintsMessage(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "agent.token")
 	if err := os.WriteFile(tokenFile, []byte("agent-secret\n"), 0o600); err != nil {

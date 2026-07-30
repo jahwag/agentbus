@@ -18,7 +18,7 @@ https://agentbus.example.com {
 	# Only agent traffic and probes are public. New daemon routes fail closed
 	# until an operator deliberately adds them here; admin inspection and /ui/*
 	# remain SSH-tunnel-only.
-	@public path /send /wait /ack /roster /mcp /mcp/* /healthz /readyz
+	@public path /send /wait /ack /roster /mcp /mcp/* /.well-known/oauth-protected-resource/mcp /healthz /readyz
 	handle @public {
 		# Preserve the daemon's loopback Host invariant at the upstream hop.
 		reverse_proxy 127.0.0.1:7777 {

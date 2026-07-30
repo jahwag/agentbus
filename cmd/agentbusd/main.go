@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,12 +20,14 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	"github.com/jahwag/agentbus/internal/buildinfo"
 	"github.com/jahwag/agentbus/internal/bus"
 	"github.com/jahwag/agentbus/internal/credentialfile"
 	"github.com/jahwag/agentbus/internal/httpapi"
 	"github.com/jahwag/agentbus/internal/mcpapi"
+	"github.com/jahwag/agentbus/internal/oidcauth"
 )
 
 func main() {
@@ -55,10 +58,6 @@ func main() {
 		os.Exit(1)
 	}
 	authOn := adminToken != ""
-	if err := httpapi.GuardListen(*listen, authOn); err != nil {
-		slog.Error("startup refused", "err", err)
-		os.Exit(1)
-	}
 	if err := ensurePrivateDBDir(*dbPath); err != nil {
 		slog.Error("db dir", "err", err)
 		os.Exit(1)
@@ -70,13 +69,85 @@ func main() {
 	}
 	defer b.Close()
 
-	api := &httpapi.Server{Bus: b, AdminToken: adminToken, DisableUI: !*uiEnabled}
+	oidcIssuer := os.Getenv("AGENTBUS_OIDC_ISSUER")
+	oidcAudience := os.Getenv("AGENTBUS_OIDC_AUDIENCE")
+	var workloadVerifier *oidcauth.Verifier
+	if oidcIssuer != "" || oidcAudience != "" {
+		if oidcIssuer == "" || oidcAudience == "" {
+			slog.Error("AGENTBUS_OIDC_ISSUER and AGENTBUS_OIDC_AUDIENCE must be set together")
+			os.Exit(2)
+		}
+		workloadVerifier, err = oidcauth.New(
+			context.Background(),
+			oidcIssuer,
+			oidcAudience,
+			envOr("AGENTBUS_OIDC_SUBJECT_CLAIM", "sub"),
+			os.Getenv("AGENTBUS_OIDC_REQUIRED_ROLE"),
+		)
+		if err != nil {
+			slog.Error("OIDC discovery", "err", err)
+			os.Exit(1)
+		}
+	}
+	mcpAuthOn := authOn || workloadVerifier != nil
+	if err := httpapi.GuardListen(*listen, mcpAuthOn); err != nil {
+		slog.Error("startup refused", "err", err)
+		os.Exit(1)
+	}
+	mcpResourceURI := envOr("AGENTBUS_MCP_RESOURCE_URI", "http://127.0.0.1:7777/mcp")
+	mcpResourceMetadataURL := envOr(
+		"AGENTBUS_MCP_RESOURCE_METADATA_URL",
+		strings.TrimSuffix(mcpResourceURI, "/mcp")+"/.well-known/oauth-protected-resource/mcp",
+	)
+
+	uiPublicOrigin, err := normalizePublicOrigin(os.Getenv("AGENTBUS_UI_PUBLIC_ORIGIN"))
+	if err != nil {
+		slog.Error("invalid AGENTBUS_UI_PUBLIC_ORIGIN", "err", err)
+		os.Exit(2)
+	}
+	uiLogoutURL, err := normalizeUILogoutURL(os.Getenv("AGENTBUS_UI_LOGOUT_URL"))
+	if err != nil {
+		slog.Error("invalid AGENTBUS_UI_LOGOUT_URL", "err", err)
+		os.Exit(2)
+	}
+	uiAssertionVerifier, err := newUIAssertionVerifier(context.Background())
+	if err != nil {
+		slog.Error("UI assertion verifier", "err", err)
+		os.Exit(1)
+	}
+	api := &httpapi.Server{
+		Bus: b, AdminToken: adminToken, DisableUI: !*uiEnabled,
+		UIAssertionVerifier: uiAssertionVerifier,
+		UIAssertionHeader:   envOr("AGENTBUS_UI_ASSERTION_HEADER", "Cf-Access-Jwt-Assertion"),
+		UIPublicOrigin:      uiPublicOrigin,
+		UILogoutURL:         uiLogoutURL,
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/", api.Handler())
-	mux.Handle("/mcp", httpapi.NoStore(httpapi.ProtectLocalMode(mcpHandler(b, adminToken), authOn)))
+	resourceMetadataChallenge := ""
+	if workloadVerifier != nil {
+		resourceMetadataChallenge = mcpResourceMetadataURL
+	}
+	mux.Handle("/mcp", httpapi.NoStore(httpapi.ProtectLocalMode(
+		mcpHandler(b, adminToken, workloadVerifier, resourceMetadataChallenge),
+		mcpAuthOn,
+	)))
+	if workloadVerifier != nil {
+		mux.Handle("GET /.well-known/oauth-protected-resource/mcp", auth.ProtectedResourceMetadataHandler(
+			&oauthex.ProtectedResourceMetadata{
+				Resource:             mcpResourceURI,
+				AuthorizationServers: []string{oidcIssuer},
+				ScopesSupported:      strings.Fields(os.Getenv("AGENTBUS_OIDC_SCOPES")),
+			},
+		))
+	}
 
-	mode := "auth-on"
-	if !authOn {
+	mode := "native-auth"
+	if authOn && workloadVerifier != nil {
+		mode = "native+oidc-auth"
+	} else if workloadVerifier != nil {
+		mode = "oidc-mcp-auth (REST/UI remain loopback-only)"
+	} else if !authOn {
 		mode = "auth-off (INSECURE dev mode: loopback-only, identities are claims)"
 	}
 	uiMode := "enabled"
@@ -157,36 +228,70 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 // mcpHandler verifies every authenticated request before the MCP protocol sees
 // it. Agent identity is carried in SDK TokenInfo and resolved again by each
 // tool call; the admin credential deliberately lacks the required agent scope.
-func mcpHandler(b *bus.Bus, adminToken string) http.Handler {
+func mcpHandler(b *bus.Bus, adminToken string, workloadVerifier *oidcauth.Verifier, resourceMetadataURL string) http.Handler {
 	h := mcpapi.Handler(b)
-	if adminToken == "" {
+	if adminToken == "" && workloadVerifier == nil {
 		return h
 	}
-	verifier := func(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
-		tokenInfo := &auth.TokenInfo{Expiration: time.Now().Add(time.Hour)}
+	verifier := func(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 		tokenHash := sha256.Sum256([]byte(token))
 		adminHash := sha256.Sum256([]byte(adminToken))
-		if subtle.ConstantTimeCompare(tokenHash[:], adminHash[:]) == 1 {
-			tokenInfo.Scopes = []string{"admin"}
-			return tokenInfo, nil
+		if adminToken != "" && subtle.ConstantTimeCompare(tokenHash[:], adminHash[:]) == 1 {
+			return &auth.TokenInfo{Scopes: []string{"admin"}}, nil
 		}
 		principal, err := b.AuthenticatePrincipal(token)
-		if err != nil {
-			if errors.Is(err, bus.ErrBadToken) {
-				return nil, fmt.Errorf("%w: invalid agent credential", auth.ErrInvalidToken)
+		if err == nil {
+			if principal.Kind != "agent" {
+				return nil, fmt.Errorf("%w: operator credentials cannot use agent tools", auth.ErrInvalidToken)
 			}
+			return &auth.TokenInfo{
+				Scopes: []string{"agent"},
+				UserID: principal.Name,
+				Extra: map[string]any{
+					"agent":                 principal.Name,
+					"credential_generation": principal.Generation,
+					"principal":             principal,
+				},
+			}, nil
+		}
+		if !errors.Is(err, bus.ErrBadToken) {
 			slog.Error("MCP credential verification failed", "err", err)
 			return nil, errors.New("credential verifier unavailable")
 		}
-		tokenInfo.Scopes = []string{"agent"}
-		tokenInfo.Extra = map[string]any{
-			"agent":                 principal.Name,
-			"credential_generation": principal.Generation,
+		if workloadVerifier == nil {
+			return nil, fmt.Errorf("%w: invalid agent credential", auth.ErrInvalidToken)
 		}
-		return tokenInfo, nil
+		assertion, err := workloadVerifier.Verify(ctx, token)
+		if errors.Is(err, oidcauth.ErrVerifierUnavailable) {
+			slog.Error("MCP workload verifier unavailable", "err", err)
+			return nil, errors.New("credential verifier unavailable")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid workload credential", auth.ErrInvalidToken)
+		}
+		principal, err = b.AuthenticateExternal(assertion.Issuer, assertion.Subject, assertion.ExpiresAt)
+		if errors.Is(err, bus.ErrBadToken) || (err == nil && principal.Kind != "agent") {
+			return nil, fmt.Errorf("%w: workload identity is not an active agent", auth.ErrInvalidToken)
+		}
+		if err != nil {
+			slog.Error("MCP external identity lookup failed", "err", err)
+			return nil, errors.New("credential verifier unavailable")
+		}
+		return &auth.TokenInfo{
+			Scopes:     append([]string{"agent"}, assertion.Scopes...),
+			Expiration: assertion.ExpiresAt,
+			UserID:     principal.Name,
+			Extra: map[string]any{
+				"agent":                 principal.Name,
+				"credential_generation": principal.Generation,
+				"principal":             principal,
+			},
+		}, nil
 	}
 	return auth.RequireBearerToken(verifier, &auth.RequireBearerTokenOptions{
-		Scopes: []string{"agent"},
+		Scopes:                 []string{"agent"},
+		ResourceMetadataURL:    resourceMetadataURL,
+		AllowMissingExpiration: true,
 	})(h)
 }
 
@@ -252,4 +357,49 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func newUIAssertionVerifier(ctx context.Context) (*oidcauth.Verifier, error) {
+	issuer := strings.TrimSuffix(strings.TrimSpace(os.Getenv("AGENTBUS_UI_ASSERTION_ISSUER")), "/")
+	audience := strings.TrimSpace(os.Getenv("AGENTBUS_UI_ASSERTION_AUDIENCE"))
+	jwksURL := strings.TrimSpace(os.Getenv("AGENTBUS_UI_ASSERTION_JWKS_URL"))
+	if issuer == "" && audience == "" && jwksURL == "" {
+		return nil, nil
+	}
+	if issuer == "" || audience == "" {
+		return nil, errors.New("AGENTBUS_UI_ASSERTION_ISSUER and AGENTBUS_UI_ASSERTION_AUDIENCE must be set together")
+	}
+	subjectClaim := envOr("AGENTBUS_UI_ASSERTION_SUBJECT_CLAIM", "sub")
+	requiredRole := os.Getenv("AGENTBUS_UI_ASSERTION_REQUIRED_ROLE")
+	if jwksURL != "" {
+		return oidcauth.NewRemote(ctx, issuer, audience, jwksURL, subjectClaim, requiredRole), nil
+	}
+	return oidcauth.New(ctx, issuer, audience, subjectClaim, requiredRole)
+}
+
+func normalizePublicOrigin(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	origin, err := url.Parse(raw)
+	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") ||
+		origin.Host == "" || origin.User != nil || origin.RawQuery != "" ||
+		origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
+		return "", errors.New("must be an absolute http(s) origin without a path, query, credentials, or fragment")
+	}
+	return origin.Scheme + "://" + origin.Host, nil
+}
+
+func normalizeUILogoutURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	logoutURL, err := url.Parse(raw)
+	if err != nil || logoutURL.Scheme != "https" || logoutURL.Host == "" ||
+		logoutURL.User != nil || logoutURL.Fragment != "" {
+		return "", errors.New("must be an absolute HTTPS URL without credentials or a fragment")
+	}
+	return logoutURL.String(), nil
 }

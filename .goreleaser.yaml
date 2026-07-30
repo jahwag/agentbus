@@ -26,10 +26,14 @@ builds:
     id: agentbus
     main: ./cmd/agentbus
     binary: agentbus
+  - <<: *agentbus-build
+    id: agentbus-mcp-bridge
+    main: ./cmd/agentbus-mcp-bridge
+    binary: agentbus-mcp-bridge
 
 archives:
   - id: native
-    ids: [agentbusd, agentbus]
+    ids: [agentbusd, agentbus, agentbus-mcp-bridge]
     formats: [tar.gz]
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
     files:

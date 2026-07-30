@@ -1,9 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,21 +23,28 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jahwag/agentbus/internal/bus"
+	"github.com/jahwag/agentbus/internal/httpapi"
+	"github.com/jahwag/agentbus/internal/oidcauth"
 )
 
 type bearerRoundTripper struct {
 	token string
 	base  http.RoundTripper
+	host  string
 }
 
 func (rt bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
 	clone.Header.Set("Authorization", "Bearer "+rt.token)
+	if rt.host != "" {
+		clone.Host = rt.host
+	}
 	return rt.base.RoundTrip(clone)
 }
 
 func TestMCPRequiresAgentCredentialOnEveryRequest(t *testing.T) {
-	b, err := bus.Open(filepath.Join(t.TempDir(), "bus.db"))
+	dbPath := filepath.Join(t.TempDir(), "bus.db")
+	b, err := bus.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +54,8 @@ func TestMCPRequiresAgentCredentialOnEveryRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	const adminToken = "admin-secret-that-is-not-an-agent"
-	h := mcpHandler(b, adminToken)
+	const metadataURL = "https://agentbus.example.com/.well-known/oauth-protected-resource/mcp"
+	h := mcpHandler(b, adminToken, nil, metadataURL)
 
 	for name, tc := range map[string]struct {
 		token string
@@ -59,8 +75,161 @@ func TestMCPRequiresAgentCredentialOnEveryRequest(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("got %d, want %d", rec.Code, tc.want)
 			}
+			if name == "missing" &&
+				!strings.Contains(rec.Header().Get("WWW-Authenticate"), `resource_metadata="`+metadataURL+`"`) {
+				t.Fatalf("challenge omitted RFC 9728 metadata URL: %q", rec.Header().Get("WWW-Authenticate"))
+			}
 		})
 	}
+}
+
+func TestOIDCOnlyMCPAllowsPublicHostWhileRESTRemainsLocal(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwks := map[string]any{"keys": []map[string]string{{
+		"kty": "RSA",
+		"kid": "test-key",
+		"use": "sig",
+		"alg": "RS256",
+		"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
+	}}}
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(jwks)
+	}))
+	defer jwksServer.Close()
+
+	issuer := jwksServer.URL + "/issuer"
+	verifier := oidcauth.NewRemote(
+		context.Background(),
+		issuer,
+		"agentbus-api",
+		jwksServer.URL,
+		"oid",
+		"AgentBus.Agent",
+	)
+	dbPath := filepath.Join(t.TempDir(), "bus.db")
+	b, err := bus.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.BindExternalIdentity("worker", "agent", issuer, "worker-oid"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	token := signAgentBusTestJWT(t, key, map[string]any{
+		"iss": issuer,
+		"aud": "agentbus-api",
+		"oid": "worker-oid",
+		"iat": now.Add(-time.Minute).Unix(),
+		"exp": now.Add(time.Hour).Unix(),
+		"roles": []string{
+			"AgentBus.Agent",
+		},
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/", (&httpapi.Server{Bus: b}).Handler())
+	mux.Handle("/mcp", httpapi.ProtectLocalMode(
+		mcpHandler(b, "", verifier, "https://agentbus.example.com/.well-known/oauth-protected-resource/mcp"),
+		true,
+	))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	session, err := mcp.NewClient(
+		&mcp.Implementation{Name: "oidc-e2e-test", Version: "0"},
+		nil,
+	).Connect(
+		context.Background(),
+		&mcp.StreamableClientTransport{
+			Endpoint: ts.URL + "/mcp",
+			HTTPClient: &http.Client{Transport: bearerRoundTripper{
+				token: token,
+				base:  http.DefaultTransport,
+				host:  "agentbus.example.com",
+			}},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(
+		context.Background(),
+		&mcp.CallToolParams{Name: "roster", Arguments: map[string]any{}},
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("OIDC official-SDK roster call = %+v, %v", result, err)
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"worker"`)) {
+		t.Fatalf("OIDC binding-derived roster omitted worker: %s", encoded)
+	}
+
+	request := func(path, bearer string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "https://agentbus.example.com"+path, nil)
+		req.Host = "agentbus.example.com"
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	if got := request("/mcp", token).Code; got != http.StatusUnsupportedMediaType {
+		t.Fatalf("valid OIDC request was blocked before MCP handling: got %d, want 415", got)
+	}
+	if got := request("/mcp", "").Code; got != http.StatusUnauthorized {
+		t.Fatalf("missing OIDC token got %d, want 401", got)
+	}
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(`DROP TABLE external_identities`); err != nil {
+		rawDB.Close()
+		t.Fatal(err)
+	}
+	rawDB.Close()
+	if got := request("/mcp", token).Code; got != http.StatusInternalServerError {
+		t.Fatalf("external identity storage failure got %d, want 500", got)
+	}
+	if got := request("/send", token).Code; got != http.StatusForbidden {
+		t.Fatalf("OIDC-only mode exposed REST on a public Host: got %d, want 403", got)
+	}
+}
+
+func signAgentBusTestJWT(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]string{
+		"alg": "RS256",
+		"kid": "test-key",
+		"typ": "JWT",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned := base64.RawURLEncoding.EncodeToString(header) + "." +
+		base64.RawURLEncoding.EncodeToString(payload)
+	digest := sha256.Sum256([]byte(unsigned))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unsigned + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
 func TestHTTPServerBoundsConnectionsAroundLongPolls(t *testing.T) {
@@ -149,7 +318,7 @@ func TestAuthenticatedStreamableMCPStampsIdentityPerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(mcpHandler(b, "admin-secret-that-is-not-an-agent"))
+	ts := httptest.NewServer(mcpHandler(b, "admin-secret-that-is-not-an-agent", nil, ""))
 	defer ts.Close()
 
 	connect := func(token string) *mcp.ClientSession {
@@ -217,7 +386,7 @@ func TestStreamableMCPWaitRejectsCredentialRotatedWhileParked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(mcpHandler(b, "admin-secret-that-is-not-an-agent"))
+	ts := httptest.NewServer(mcpHandler(b, "admin-secret-that-is-not-an-agent", nil, ""))
 	defer ts.Close()
 
 	connect := func(token string) *mcp.ClientSession {
@@ -323,5 +492,55 @@ func TestStreamableMCPWaitRejectsCredentialRotatedWhileParked(t *testing.T) {
 	}
 	if !out.Delivery.Redelivery || len(out.Delivery.Messages) != 1 || out.Delivery.Messages[0].Body != marker {
 		t.Fatalf("replacement did not receive preserved redelivery: %s", raw)
+	}
+}
+
+func TestNormalizePublicOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"", "", true},
+		{" https://agentbus.example.com/ ", "https://agentbus.example.com", true},
+		{"http://127.0.0.1:7777", "http://127.0.0.1:7777", true},
+		{"https://agentbus.example.com/ui", "", false},
+		{"https://user@example.test", "", false},
+		{"javascript:alert(1)", "", false},
+	} {
+		got, err := normalizePublicOrigin(tc.raw)
+		if tc.ok && (err != nil || got != tc.want) {
+			t.Errorf("normalizePublicOrigin(%q) = %q, %v", tc.raw, got, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("normalizePublicOrigin(%q) unexpectedly succeeded with %q", tc.raw, got)
+		}
+	}
+}
+
+func TestNormalizeUILogoutURL(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"", "", true},
+		{
+			"https://agentbus.example.com/cdn-cgi/access/logout",
+			"https://agentbus.example.com/cdn-cgi/access/logout",
+			true,
+		},
+		{"http://agentbus.example.com/logout", "", false},
+		{"https://user@agentbus.example.com/logout", "", false},
+		{"https://agentbus.example.com/logout#fragment", "", false},
+		{"javascript:alert(1)", "", false},
+	} {
+		got, err := normalizeUILogoutURL(tc.raw)
+		if tc.ok && (err != nil || got != tc.want) {
+			t.Errorf("normalizeUILogoutURL(%q) = %q, %v", tc.raw, got, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("normalizeUILogoutURL(%q) unexpectedly succeeded with %q", tc.raw, got)
+		}
 	}
 }
