@@ -35,6 +35,7 @@ build:
 	mkdir -p bin
 	CGO_ENABLED=0 go build -trimpath -o bin/agentbusd ./cmd/agentbusd
 	CGO_ENABLED=0 go build -trimpath -o bin/agentbus ./cmd/agentbus
+	CGO_ENABLED=0 go build -trimpath -o bin/agentbus-mcp-bridge ./cmd/agentbus-mcp-bridge
 
 cross-compile:
 	@set -eu; \
@@ -45,6 +46,7 @@ cross-compile:
 		echo "==> $$os/$$arch"; \
 		CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" go build -trimpath -o "$$out/agentbusd" ./cmd/agentbusd; \
 		CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" go build -trimpath -o "$$out/agentbus" ./cmd/agentbus; \
+		CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" go build -trimpath -o "$$out/agentbus-mcp-bridge" ./cmd/agentbus-mcp-bridge; \
 	done
 
 vulncheck:

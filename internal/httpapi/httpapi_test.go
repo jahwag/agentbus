@@ -2,20 +2,29 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jahwag/agentbus/internal/bus"
+	"github.com/jahwag/agentbus/internal/oidcauth"
 )
 
 func server(t *testing.T) *httptest.Server {
@@ -238,6 +247,59 @@ func TestAuthDerivedIdentity(t *testing.T) {
 	}
 	if resp := do("POST", "/retire", minted.Token, map[string]string{"name": "lead", "reason": "x"}); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("agent token on retire must 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestAdminCannotConvertAgentOrMintOperatorNativeCredential(t *testing.T) {
+	b, err := bus.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	token, err := b.Mint("human.alex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"operator.alex",
+		"operator",
+		"https://edge.example",
+		"operator-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer((&Server{Bus: b, AdminToken: "admin-secret"}).Handler())
+	t.Cleanup(ts.Close)
+
+	post := func(path, body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer admin-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	resp := post(
+		"/bind-identity",
+		`{"name":"human.alex","kind":"operator","issuer":"https://edge.example","subject":"human-1"}`,
+	)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("agent-to-operator conversion got %d, want 409", resp.StatusCode)
+	}
+	if _, err := b.AuthenticatePrincipal(token); err != nil {
+		t.Fatalf("failed HTTP kind change revoked agent credential: %v", err)
+	}
+	resp = post("/mint", `{"name":"operator.alex"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("native operator mint got %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -1324,6 +1386,315 @@ func TestUISessionsExpireAndDoNotSurviveHandlerRestart(t *testing.T) {
 		!bytes.Contains(raw, []byte(`name="code"`)) {
 		t.Fatalf("session crossed a handler restart: %s", raw)
 	}
+}
+
+func TestUIAssertionCreatesBoundOperatorSessionAndSendsAttributedMessage(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kty": "RSA", "kid": "ui-test", "use": "sig", "alg": "RS256",
+			"n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(
+				big.NewInt(int64(key.E)).Bytes(),
+			),
+		}}})
+	}))
+	defer jwksServer.Close()
+
+	const (
+		issuer       = "https://edge.example"
+		publicOrigin = "https://agentbus.example.com"
+	)
+	verifier := oidcauth.NewRemote(
+		context.Background(),
+		issuer,
+		"agentbus-ui",
+		jwksServer.URL,
+		"oid",
+		"AgentBus.Operator",
+	)
+	b, err := bus.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.BindExternalIdentity("alex.operator", "operator", issuer, "operator-oid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Mint("worker"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer((&Server{
+		Bus: b, AdminToken: "admin-secret",
+		UIAssertionVerifier: verifier,
+		UIAssertionHeader:   "X-Edge-Assertion",
+		UIPublicOrigin:      publicOrigin,
+		UILogoutURL:         publicOrigin + "/cdn-cgi/access/logout",
+	}).Handler())
+	defer ts.Close()
+
+	token := signUIJWT(t, key, map[string]any{
+		"iss": issuer,
+		"aud": "agentbus-ui",
+		"sub": "unstable-sub",
+		"oid": "operator-oid",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"roles": []string{
+			"AgentBus.Operator",
+		},
+	})
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/ui/messages", nil)
+	req.Host = "agentbus.example.com"
+	req.Header.Set("X-Edge-Assertion", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(raw, []byte("Send as alex.operator")) {
+		t.Fatalf("operator messages page = %d %s", resp.StatusCode, raw)
+	}
+	if len(resp.Cookies()) != 1 || !resp.Cookies()[0].Secure ||
+		!resp.Cookies()[0].HttpOnly || resp.Cookies()[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("operator session cookie = %+v", resp.Cookies())
+	}
+	cookie := resp.Cookies()[0]
+	commandMatch := regexp.MustCompile(
+		`name="client_message_id" value="([^"]+)"`,
+	).FindSubmatch(raw)
+	if len(commandMatch) != 2 || !validUIClientMessageID(string(commandMatch[1])) {
+		t.Fatalf("messages page omitted server-generated command identifier: %s", raw)
+	}
+
+	form := url.Values{
+		"to":                {"worker"},
+		"body":              {"status please"},
+		"reply_to":          {""},
+		"client_message_id": {string(commandMatch[1])},
+	}
+	noRedirect := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	for attempt := 0; attempt < 2; attempt++ {
+		req, _ = http.NewRequest(http.MethodPost, ts.URL+"/ui/send", strings.NewReader(form.Encode()))
+		req.Host = "agentbus.example.com"
+		req.Header.Set("Origin", publicOrigin)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+		resp, err = noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/messages" {
+			t.Fatalf(
+				"operator send attempt %d = %d location=%q",
+				attempt,
+				resp.StatusCode,
+				resp.Header.Get("Location"),
+			)
+		}
+	}
+	routes, err := b.RecentRoutes(0, 10)
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("routes after operator send = %+v, %v", routes, err)
+	}
+	message, err := b.MessageContent(routes[0].MessageID)
+	if err != nil || message.From != "alex.operator" || message.To != "worker" ||
+		message.Body != "status please" {
+		t.Fatalf("attributed operator message = %+v, %v", message, err)
+	}
+
+	events, err := b.AuditEvents(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var auditCount int
+	for _, event := range events {
+		if event.Action == "operator_send" {
+			auditCount++
+		}
+	}
+	if auditCount != 1 {
+		t.Fatalf("idempotent retry produced %d operator_send events", auditCount)
+	}
+
+	replyTo := message.MessageID
+	reply, err := b.Send("worker", "alex.operator", bus.SendOpts{
+		Body:            `<script>alert("reply")</script>`,
+		Data:            json.RawMessage(`{"html":"<svg onload=alert(2)>"}`),
+		ReplyTo:         &replyTo,
+		ClientMessageID: "agent-operator-reply",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := func(messageID string) (int, []byte) {
+		t.Helper()
+		form := url.Values{"message_id": {messageID}}
+		req, _ := http.NewRequest(
+			http.MethodPost,
+			ts.URL+"/ui/conversation",
+			strings.NewReader(form.Encode()),
+		)
+		req.Host = "agentbus.example.com"
+		req.Header.Set("Origin", publicOrigin)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, raw
+	}
+	status, raw := conversation(message.MessageID)
+	if status != http.StatusOK {
+		t.Fatalf("operator conversation = %d %s", status, raw)
+	}
+	for _, unsafe := range []string{"<script>", "<svg onload"} {
+		if bytes.Contains(raw, []byte(unsafe)) {
+			t.Fatalf("conversation rendered hostile content as markup %q: %s", unsafe, raw)
+		}
+	}
+	for _, expected := range []string{
+		"&lt;script&gt;",
+		`\u003csvg onload=alert(2)\u003e`,
+		`name="to" value="worker"`,
+		`name="reply_to" value="` + reply.MessageID + `"`,
+		`name="client_message_id" value="operator-ui-`,
+	} {
+		if !bytes.Contains(raw, []byte(expected)) {
+			t.Fatalf("conversation omitted %q: %s", expected, raw)
+		}
+	}
+	status, raw = conversation("msg_00000000000000000000000000000000")
+	if status != http.StatusNotFound || bytes.Contains(raw, []byte("status please")) {
+		t.Fatalf("missing conversation = %d %s", status, raw)
+	}
+
+	operator, err := b.AuthenticateExternal(
+		issuer,
+		"operator-oid",
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := reply.MessageID
+	for i := 0; i < 100; i++ {
+		next, err := b.SendAsOperator(operator, "worker", bus.SendOpts{
+			Body:            fmt.Sprintf("bounded-reply-%d", i),
+			ReplyTo:         &parent,
+			ClientMessageID: fmt.Sprintf("bounded-ui-conversation-%d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent = next.MessageID
+	}
+	status, raw = conversation(message.MessageID)
+	if status != http.StatusOK ||
+		!bytes.Contains(raw, []byte("This view is capped at 100 retained messages.")) {
+		t.Fatalf("truncated conversation = %d %s", status, raw)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/ui/logout", nil)
+	req.Host = "agentbus.example.com"
+	req.Header.Set("Origin", publicOrigin)
+	req.AddCookie(cookie)
+	resp, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther ||
+		resp.Header.Get("Location") != publicOrigin+"/cdn-cgi/access/logout" ||
+		len(resp.Cookies()) != 1 || resp.Cookies()[0].MaxAge >= 0 {
+		t.Fatalf(
+			"edge logout status/location/cookie = %d %q %+v",
+			resp.StatusCode,
+			resp.Header.Get("Location"),
+			resp.Cookies(),
+		)
+	}
+}
+
+func TestNativeUISessionCannotSendOrImpersonate(t *testing.T) {
+	b, err := bus.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := b.Mint("worker"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer((&Server{Bus: b, AdminToken: "admin-secret"}).Handler())
+	defer ts.Close()
+	cookie := loginUI(t, ts.URL, "admin-secret")
+
+	for name, form := range map[string]url.Values{
+		"native session": {
+			"to": {"worker"}, "body": {"forbidden"}, "reply_to": {""},
+		},
+		"impersonation field": {
+			"from": {"victim"}, "to": {"worker"}, "body": {"forbidden"}, "reply_to": {""},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, _ := http.NewRequest(
+				http.MethodPost,
+				ts.URL+"/ui/send",
+				strings.NewReader(form.Encode()),
+			)
+			req.Header.Set("Origin", ts.URL)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.AddCookie(cookie)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("send status = %d", resp.StatusCode)
+			}
+		})
+	}
+	routes, err := b.RecentRoutes(0, 10)
+	if err != nil || len(routes) != 0 {
+		t.Fatalf("forbidden UI send created routes: %+v, %v", routes, err)
+	}
+}
+
+func signUIJWT(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]string{"alg": "RS256", "kid": "ui-test", "typ": "JWT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned := base64.RawURLEncoding.EncodeToString(header) + "." +
+		base64.RawURLEncoding.EncodeToString(payload)
+	digest := sha256.Sum256([]byte(unsigned))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unsigned + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
 func TestEveryUIOutcomeCarriesBrowserHardeningHeaders(t *testing.T) {

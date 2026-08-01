@@ -5,7 +5,7 @@ The units assume a static, unprivileged `agentbus` account, binaries in
 
 ```sh
 useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin agentbus
-install -m 0755 agentbus agentbusd /usr/local/bin/
+install -m 0755 agentbus agentbusd agentbus-mcp-bridge /usr/local/bin/
 install -d -m 0700 /etc/agentbus
 umask 077
 openssl rand -hex 32 > /etc/agentbus/admin-token
@@ -20,7 +20,9 @@ systemctl enable --now agentbusd.service agentbus-prune.timer
 mode 0700. Verify with `curl --fail http://127.0.0.1:7777/readyz`,
 `systemctl status agentbusd`, and `journalctl -u agentbusd`.
 
-Upgrades are coordinated across the binary pair. Copy each artifact to a unique
+Daemon and administrator CLI upgrades are coordinated across the binary pair.
+The optional client-side `agentbus-mcp-bridge` can be rolled independently.
+Copy each daemon/CLI artifact to a unique
 temporary filename on the target filesystem, verify its checksum and
 `--version` there, then stop the daemon and maintenance unit. Sync and rename
 both staged files over their final paths, verify the installed checksums, and

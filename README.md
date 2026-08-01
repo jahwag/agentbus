@@ -78,6 +78,13 @@ acknowledge only after processing succeeds.
 Broadcasts create an independent receipt for every intended recipient. One
 slow consumer does not block the others.
 
+Operator mailboxes are UI principals, not agent consumers: they never appear
+in the agent roster or receive `wait`/`ack` deliveries. A direct agent reply to
+an operator is retained in the conversation and recent-route views without a
+mailbox receipt, so it is visible in the chat UI but is not an at-least-once
+agent delivery. Normal retention pruning removes these records on the same
+schedule as other settled message history.
+
 ## Where it fits
 
 Use AgentBus when:
@@ -100,8 +107,9 @@ redelivery, acknowledgement, leases, and an operator audit trail.
   acknowledgement, roster lookup, and related coordination.
 - **CLI:** Administrative and mailbox commands through `bin/agentbus`.
 - **HTTP:** Health, readiness, mailbox, audit, and operator endpoints.
-- **Operator UI:** Capability-scoped inspection without exposing message bodies
-  in activity views.
+- **Operator UI:** Overview and message-conversation views with explicit
+  content reveal. Externally bound operators may send direct, attributed
+  messages; native administrator-code sessions remain inspection-only.
 
 Run the binaries with `--help` for the current command and configuration
 surface:
@@ -124,6 +132,105 @@ only. For shared hosts or networks:
 - keep the daemon on loopback or behind an authenticated TLS reverse proxy;
 - protect the SQLite database and token files with restrictive permissions;
 - never place tokens in command arguments, repository files, or logs.
+
+AgentBus can validate native agent tokens and OIDC workload access tokens at
+the same `/mcp` resource. OIDC mode uses provider discovery/JWKS and supports a
+stable `oid` subject plus a required application role:
+
+```text
+AGENTBUS_OIDC_ISSUER=https://identity.example.com/tenant/v2.0
+AGENTBUS_OIDC_AUDIENCE=EXPECTED_ACCESS_TOKEN_AUD
+AGENTBUS_OIDC_SUBJECT_CLAIM=oid
+AGENTBUS_OIDC_REQUIRED_ROLE=AgentBus.Agent
+AGENTBUS_MCP_RESOURCE_URI=https://agentbus.example.com/mcp
+```
+
+Bind each validated `(issuer, subject)` to one local mailbox with
+`agentbus bind-identity`. Operators and agents are separate principal kinds;
+operator identities cannot call agent MCP tools.
+
+For short-lived Entra client-credential tokens, run
+`agentbus-mcp-bridge` as the local stdio MCP process. It uses
+`DefaultAzureCredential`, caches and refreshes access tokens, and accepts
+`AGENTBUS_MCP_URL` plus `AGENTBUS_SCOPE` or `AGENTBUS_AUDIENCE`. A native
+`AGENTBUS_TOKEN` remains the portable fallback. The Entra path requires an
+explicit `AZURE_TOKEN_CREDENTIALS`; use `prod` for unattended services so the
+credential chain cannot fall through to a cached CLI/developer identity.
+
+For Entra v2 specifically, set the daemon's `AGENTBUS_OIDC_AUDIENCE` to the
+resource application's bare client-ID GUID because that is the access token's
+`aud`. The bridge's token-request audience remains
+`api://RESOURCE_APP_ID` (or use the explicit
+`api://RESOURCE_APP_ID/.default` scope).
+
+Browser authentication is provider-neutral and independent of MCP resource
+authorization. Deployments can choose any combination of three modes:
+
+- Native OpenID Connect Authorization Code login with PKCE, state, and nonce.
+  AgentBus validates the ID token itself, resolves its `(issuer, subject)`
+  through an explicit `operator` binding, and issues its own opaque UI session.
+- Trusted-edge JWT assertion exchange. This remains useful when an access proxy
+  already owns browser login, but the proxy does not become the MCP
+  authorization server.
+- A loopback one-time code minted with the administrator credential. This is
+  the portable local recovery and single-host mode.
+
+Native browser OIDC uses standard discovery and JWKS and works with Entra ID,
+Keycloak, Authentik, Okta, and other conforming providers:
+
+```text
+AGENTBUS_UI_PUBLIC_ORIGIN=https://agentbus.example.com
+AGENTBUS_UI_OIDC_ISSUER=https://identity.example.com/tenant/v2.0
+AGENTBUS_UI_OIDC_CLIENT_ID=agentbus-browser-client
+AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE=/run/credentials/agentbusd/oidc-client-secret
+AGENTBUS_UI_OIDC_REDIRECT_URL=https://agentbus.example.com/ui/auth/oidc/callback
+AGENTBUS_UI_OIDC_SCOPES=openid profile email
+AGENTBUS_UI_OIDC_SUBJECT_CLAIM=oid
+AGENTBUS_UI_OIDC_REQUIRED_ROLE=AgentBus.Operator
+```
+
+`AGENTBUS_UI_OIDC_ISSUER` and `AGENTBUS_UI_OIDC_CLIENT_ID` must be set together.
+The redirect URL defaults to the exact callback under
+`AGENTBUS_UI_PUBLIC_ORIGIN` and cannot point elsewhere when a public origin is
+configured. Supply the optional confidential-client secret through
+`AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE` where possible, or through
+`AGENTBUS_UI_OIDC_CLIENT_SECRET`; omit both for providers that allow public
+clients. Scopes default to `openid profile email`; `openid` is always added.
+The subject claim is restricted to `sub` or `oid` and defaults to `sub`.
+Required role is optional and expects a top-level JSON `roles` string array;
+providers that use groups, nested realm roles, or another claim need a
+provider-side claim mapping. Discovery is lazy and retryable: provider downtime
+does not prevent daemon startup, but login remains unavailable until discovery
+succeeds. Encrypted flow state does not consume server admission slots;
+consumed-state replay markers, concurrent token exchanges, and per-principal
+sessions are bounded. Bind the resulting identity before login:
+
+```bash
+agentbus bind-identity \
+  --admin-token-file /run/credentials/agentbusd/admin-token \
+  --name operator \
+  --kind operator \
+  --issuer https://identity.example.com/tenant/v2.0 \
+  --subject-file /etc/agentbus/operator-subject
+```
+
+The subject file must be owner-only (or a systemd credential), bounded, and
+free of newline/NUL bytes. `--subject` remains available for interactive use,
+but `--subject-file` keeps stable identity identifiers out of process arguments.
+
+Public native OIDC requires TLS, an exact public Host, and outbound HTTPS/DNS
+from the daemon for discovery, JWKS retrieval, and token exchange. The Caddy
+example contains a dedicated `/ui` route that preserves Host, and
+`deploy/systemd/agentbusd-oidc.conf.example` shows secret-file loading and the
+network-policy override required by the intentionally loopback-only base unit.
+HTTPS sessions and flow state use `__Host-` cookies with `Path=/`.
+
+For trusted-edge mode, configure `AGENTBUS_UI_ASSERTION_ISSUER`,
+`AGENTBUS_UI_ASSERTION_AUDIENCE`, `AGENTBUS_UI_ASSERTION_JWKS_URL`, and
+`AGENTBUS_UI_PUBLIC_ORIGIN`; then bind the assertion identity to an `operator`
+mailbox. Set `AGENTBUS_UI_LOGOUT_URL` to the edge provider's HTTPS logout
+endpoint so ending the product session also ends the upstream session instead
+of immediately exchanging a still-valid assertion again.
 
 Read [SECURITY.md](SECURITY.md) before exposing AgentBus beyond a trusted local
 machine. Operational defaults and recovery procedures live in

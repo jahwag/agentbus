@@ -15,14 +15,27 @@ https://agentbus.example.com {
 		max_size 256KB
 	}
 
-	# Only agent traffic and probes are public. New daemon routes fail closed
-	# until an operator deliberately adds them here; admin inspection and /ui/*
-	# remain SSH-tunnel-only.
-	@public path /send /wait /ack /roster /mcp /mcp/* /healthz /readyz
-	handle @public {
-		# Preserve the daemon's loopback Host invariant at the upstream hop.
+	# The browser UI is an application-authenticated surface. Preserve its
+	# public Host so AgentBus can enforce AGENTBUS_UI_PUBLIC_ORIGIN and complete
+	# native OIDC callbacks. Configure native OIDC or trusted-edge assertion
+	# verification before enabling this route.
+	@ui path /ui /ui/*
+	handle @ui {
 		reverse_proxy 127.0.0.1:7777 {
-			header_up Host 127.0.0.1:7777
+			header_up Host {http.request.host}
+		}
+	}
+
+	# Only agent traffic, the separately authenticated browser UI, and probes
+	# are public. New daemon routes fail closed until an operator deliberately
+	# adds them here; administrator inspection remains local-only.
+	@public path /send /wait /ack /roster /mcp /mcp/* /.well-known/oauth-protected-resource/mcp /healthz /readyz
+	handle @public {
+		reverse_proxy 127.0.0.1:7777 {
+			# Preserve the public Host. In OIDC-only deployments the daemon uses
+			# it to keep unauthenticated REST local while the MCP verifier remains
+			# independently available.
+			header_up Host {http.request.host}
 			transport http {
 				response_header_timeout 5m10s
 			}

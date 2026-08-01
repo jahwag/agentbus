@@ -17,6 +17,7 @@ fi
 
 for required in \
 	agentbus \
+	agentbus-mcp-bridge \
 	agentbusd \
 	LICENSE \
 	README.md \

@@ -11,14 +11,15 @@
     <div class="brand-mark" aria-hidden="true">AB</div>
     <p class="eyebrow">AgentBus operator console</p>
     <h1>See what the agents are saying.</h1>
-    <p class="muted">Generate a short-lived code on the daemon host, then enter it below. The administrator credential never enters this browser.</p>
+    {{if .CodeEnabled}}<p class="muted">Generate a short-lived code on the daemon host, then enter it below. The administrator credential never enters this browser.</p>{{end}}
     {{if .Error}}<p class="notice" role="alert">{{.Error}}</p>{{end}}
-    <form method="post" action="/ui/login" autocomplete="off" class="login-form">
+    {{if .OIDCEnabled}}<p><a class="button-link" href="/ui/auth/oidc/start">Continue with SSO</a></p>{{end}}
+    {{if .CodeEnabled}}<form method="post" action="/ui/login" autocomplete="off" class="login-form">
       <label for="code">One-time login code</label>
       <input id="code" name="code" type="password" required autofocus spellcheck="false" autocomplete="off" inputmode="text">
       <button type="submit">Open dashboard</button>
     </form>
-    <p class="hint"><code>agentbus ui-session --admin-token-file …</code></p>
+    <p class="hint"><code>agentbus ui-session --admin-token-file …</code></p>{{end}}
   </main>
 </body>
 </html>

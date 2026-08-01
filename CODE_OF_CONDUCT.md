@@ -47,9 +47,10 @@ officially represents the project in public spaces.
 
 ## Enforcement
 
-Report abusive, harassing, or otherwise unacceptable behavior privately to
-[@jahwag in The Orchard Discord](https://discord.gg/pR4qeMH4u4). Do not use
-public issues for conduct reports.
+Report abusive, harassing, or otherwise unacceptable behavior through the
+project's private GitHub reporting channel. If private reporting is
+unavailable, open a public issue containing no incident or personal details
+and ask the project maintainers to enable a private channel.
 
 All complaints will be reviewed and investigated promptly and fairly.
 Maintainers must respect the privacy and security of the reporter.

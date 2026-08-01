@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentBus · Messages</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">AgentBus operator console</p>
+      <h1>Messages</h1>
+    </div>
+    <div class="topbar-actions">
+      <nav aria-label="Operator console"><a href="/ui/">Overview</a><a class="nav-current" href="/ui/messages">Messages</a></nav>
+      <form method="post" action="/ui/logout"><button class="button-secondary" type="submit">Log out</button></form>
+    </div>
+  </header>
+  <main class="page-shell">
+    <p class="notice">Retained recent traffic only. Content stays on the server until you explicitly open a conversation.</p>
+
+    {{if .CanSend}}
+    <section class="panel compose-panel">
+      <div class="section-heading"><div><p class="eyebrow">From {{.Operator}}</p><h2>Send a direct message</h2></div><span>No broadcast or impersonation</span></div>
+      <form method="post" action="/ui/send" class="compose-form">
+        <label for="to">Recipient</label>
+        <input id="to" name="to" list="agentbus-roster" required pattern="[a-z0-9][a-z0-9._-]{0,63}" autocomplete="off">
+        <datalist id="agentbus-roster">{{range .Roster}}<option value="{{.Name}}">{{end}}</datalist>
+        <label for="body">Message</label>
+        <textarea id="body" name="body" required maxlength="65536"></textarea>
+        <input type="hidden" name="reply_to" value="">
+        <input type="hidden" name="client_message_id" value="{{.CommandID}}">
+        <button type="submit">Send as {{.Operator}}</button>
+      </form>
+    </section>
+    {{else}}
+    <p class="identity-note">This native administrator-code session can inspect messages but cannot send them.</p>
+    {{end}}
+
+    <section class="panel">
+      <div class="section-heading"><div><p class="eyebrow">Routing metadata</p><h2>Recent messages</h2></div><span>Newest first</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Seq</th><th>From</th><th>To</th><th>Receipts</th><th>Time</th><th><span class="visually-hidden">Action</span></th></tr></thead>
+          <tbody>
+          {{range .Routes}}
+            <tr>
+              <td class="sequence">#{{.Seq}}</td><td class="name">{{.From}}</td><td class="name">{{.To}}</td>
+              <td class="receipt-summary"><span title="pending">P {{.Receipts.Pending}}</span><span title="offered">O {{.Receipts.Offered}}</span><span title="acknowledged">A {{.Receipts.Acked}}</span><span title="dead-lettered">D {{.Receipts.Dead}}</span></td>
+              <td class="timestamp">{{.TS}}</td>
+              <td class="message-actions">
+                <form method="post" action="/ui/conversation"><input type="hidden" name="message_id" value="{{.MessageID}}"><button class="button-small" type="submit">Conversation</button></form>
+                <form method="post" action="/ui/reveal"><input type="hidden" name="message_id" value="{{.MessageID}}"><button class="button-small button-muted" type="submit">Single message</button></form>
+              </td>
+            </tr>
+          {{else}}<tr><td colspan="6" class="empty">No retained messages yet.</td></tr>{{end}}
+          </tbody>
+        </table>
+      </div>
+      {{if .HasOlder}}<a class="older-link" href="/ui/messages?before_seq={{.NextBefore}}">View older traffic →</a>{{end}}
+    </section>
+  </main>
+</body>
+</html>
