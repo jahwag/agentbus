@@ -207,10 +207,15 @@ unset admin_secret ui_code ui_cookie
 
 grep '@public path /send /wait /ack /roster /mcp /mcp/\* /.well-known/oauth-protected-resource/mcp /healthz /readyz' deploy/Caddyfile.example >/dev/null
 grep 'respond "HTTPS required" 426' deploy/Caddyfile.example >/dev/null
-if grep '@public path .* /ui' deploy/Caddyfile.example >/dev/null; then
-	echo 'Caddy public allowlist exposed the operator UI' >&2
+grep '@ui path /ui /ui/\*' deploy/Caddyfile.example >/dev/null
+grep 'header_up Host {http.request.host}' deploy/Caddyfile.example >/dev/null
+if grep 'header_up Host 127.0.0.1' deploy/Caddyfile.example >/dev/null; then
+	echo 'Caddy must not make public requests appear loopback-local' >&2
 	exit 1
 fi
+grep 'AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE=%d/oidc-client-secret' deploy/systemd/agentbusd-oidc.conf.example >/dev/null
+grep '^IPAddressDeny=$' deploy/systemd/agentbusd-oidc.conf.example >/dev/null
+grep '^IPAddressAllow=$' deploy/systemd/agentbusd-oidc.conf.example >/dev/null
 
 stop_daemon
 ui_enabled=false

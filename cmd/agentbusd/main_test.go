@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -504,6 +505,8 @@ func TestNormalizePublicOrigin(t *testing.T) {
 		{"", "", true},
 		{" https://agentbus.example.com/ ", "https://agentbus.example.com", true},
 		{"http://127.0.0.1:7777", "http://127.0.0.1:7777", true},
+		{"http://agentbus.localhost:7777", "http://agentbus.localhost:7777", true},
+		{"http://agentbus.example.com", "", false},
 		{"https://agentbus.example.com/ui", "", false},
 		{"https://user@example.test", "", false},
 		{"javascript:alert(1)", "", false},
@@ -515,6 +518,117 @@ func TestNormalizePublicOrigin(t *testing.T) {
 		if !tc.ok && err == nil {
 			t.Errorf("normalizePublicOrigin(%q) unexpectedly succeeded with %q", tc.raw, got)
 		}
+	}
+}
+
+func TestNewUIBrowserOIDCRequiresCompleteExactConfiguration(t *testing.T) {
+	for _, key := range []string{
+		"AGENTBUS_UI_OIDC_ISSUER",
+		"AGENTBUS_UI_OIDC_CLIENT_ID",
+		"AGENTBUS_UI_OIDC_CLIENT_SECRET",
+		"AGENTBUS_UI_OIDC_REDIRECT_URL",
+		"AGENTBUS_UI_OIDC_SCOPES",
+		"AGENTBUS_UI_OIDC_SUBJECT_CLAIM",
+		"AGENTBUS_UI_OIDC_REQUIRED_ROLE",
+	} {
+		t.Setenv(key, "")
+	}
+	const publicOrigin = "https://agentbus.example.com"
+
+	t.Setenv("AGENTBUS_UI_OIDC_ISSUER", "https://identity.example.com/tenant/v2.0")
+	if _, err := newUIBrowserOIDC(context.Background(), publicOrigin); err == nil {
+		t.Fatal("issuer without client ID unexpectedly accepted")
+	}
+
+	t.Setenv("AGENTBUS_UI_OIDC_CLIENT_ID", "agentbus-browser")
+	t.Setenv("AGENTBUS_UI_OIDC_REDIRECT_URL", "https://attacker.example/callback")
+	if _, err := newUIBrowserOIDC(context.Background(), publicOrigin); err == nil {
+		t.Fatal("redirect outside public origin unexpectedly accepted")
+	}
+}
+
+func TestNewUIBrowserOIDCUsesPublicOriginCallback(t *testing.T) {
+	var provider *httptest.Server
+	provider = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                provider.URL,
+			"authorization_endpoint":                provider.URL + "/authorize",
+			"token_endpoint":                        provider.URL + "/token",
+			"jwks_uri":                              provider.URL + "/keys",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		})
+	}))
+	defer provider.Close()
+	for _, key := range []string{
+		"AGENTBUS_UI_OIDC_CLIENT_SECRET",
+		"AGENTBUS_UI_OIDC_REDIRECT_URL",
+		"AGENTBUS_UI_OIDC_SCOPES",
+		"AGENTBUS_UI_OIDC_REQUIRED_ROLE",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AGENTBUS_UI_OIDC_ISSUER", provider.URL)
+	t.Setenv("AGENTBUS_UI_OIDC_CLIENT_ID", "agentbus-browser")
+	t.Setenv("AGENTBUS_UI_OIDC_SUBJECT_CLAIM", "oid")
+	const publicOrigin = "https://agentbus.example.com"
+	oidcLogin, err := newUIBrowserOIDC(context.Background(), publicOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := bus.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ts := httptest.NewServer((&httpapi.Server{
+		Bus:            b,
+		AdminToken:     "admin-secret",
+		UIOIDC:         oidcLogin,
+		UIPublicOrigin: publicOrigin,
+	}).Handler())
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/ui/auth/oidc/start", nil)
+	req.Host = "agentbus.example.com"
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	response, err := (&http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	location, err := url.Parse(response.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := location.Query().Get("redirect_uri"); got != publicOrigin+"/ui/auth/oidc/callback" {
+		t.Fatalf("redirect_uri = %q", got)
+	}
+}
+
+func TestLoadOptionalSecretUsesProtectedFileAndRejectsAmbiguousSource(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "oidc-secret")
+	if err := os.WriteFile(secretFile, []byte("file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SECRET", "")
+	t.Setenv("TEST_SECRET_FILE", secretFile)
+	secret, err := loadOptionalSecret("TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || secret != "file-secret" {
+		t.Fatalf("file secret = %q, %v", secret, err)
+	}
+	t.Setenv("TEST_SECRET", "inline-secret")
+	if _, err := loadOptionalSecret("TEST_SECRET", "TEST_SECRET_FILE"); err == nil {
+		t.Fatal("inline and file secret sources unexpectedly accepted together")
 	}
 }
 

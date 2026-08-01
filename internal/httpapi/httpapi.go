@@ -45,6 +45,7 @@ type Server struct {
 	// explicitly bound to an operator mailbox in AgentBus.
 	UIAssertionVerifier *oidcauth.Verifier
 	UIAssertionHeader   string
+	UIOIDC              *BrowserOIDC
 	UIPublicOrigin      string
 	UILogoutURL         string
 	uiNow               func() time.Time
@@ -175,6 +176,8 @@ func (s *Server) Handler() http.Handler {
 		uiStore := s.newUICredentialStore()
 		mux.HandleFunc("POST /ui/bootstrap", s.requireAdmin(s.handleUIBootstrap(uiStore)))
 		mux.HandleFunc("POST /ui/login", s.handleUILogin(uiStore))
+		mux.HandleFunc("GET /ui/auth/oidc/start", s.handleUIOIDCStart)
+		mux.HandleFunc("GET /ui/auth/oidc/callback", s.handleUIOIDCCallback(uiStore))
 		mux.HandleFunc("GET /ui", s.handleUIRoot)
 		mux.HandleFunc("GET /ui/", s.handleUIDashboard(uiStore))
 		mux.HandleFunc("GET /ui/messages", s.handleUIMessages(uiStore))
@@ -197,7 +200,18 @@ func (s *Server) Handler() http.Handler {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	return NoStore(uiSecurityHeadersForPaths(ProtectLocalMode(mux, s.authEnabled())))
+	protected := ProtectLocalMode(mux, s.authEnabled())
+	if !s.authEnabled() && (s.UIOIDC != nil || s.UIAssertionVerifier != nil) {
+		localOnly := protected
+		protected = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+				mux.ServeHTTP(w, r)
+				return
+			}
+			localOnly.ServeHTTP(w, r)
+		})
+	}
+	return NoStore(uiSecurityHeadersForPaths(protected))
 }
 
 // NoStore prevents mailbox deliveries and newly minted credentials from being

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -100,25 +101,36 @@ func main() {
 		strings.TrimSuffix(mcpResourceURI, "/mcp")+"/.well-known/oauth-protected-resource/mcp",
 	)
 
-	uiPublicOrigin, err := normalizePublicOrigin(os.Getenv("AGENTBUS_UI_PUBLIC_ORIGIN"))
-	if err != nil {
-		slog.Error("invalid AGENTBUS_UI_PUBLIC_ORIGIN", "err", err)
-		os.Exit(2)
-	}
-	uiLogoutURL, err := normalizeUILogoutURL(os.Getenv("AGENTBUS_UI_LOGOUT_URL"))
-	if err != nil {
-		slog.Error("invalid AGENTBUS_UI_LOGOUT_URL", "err", err)
-		os.Exit(2)
-	}
-	uiAssertionVerifier, err := newUIAssertionVerifier(context.Background())
-	if err != nil {
-		slog.Error("UI assertion verifier", "err", err)
-		os.Exit(1)
+	var uiPublicOrigin, uiLogoutURL string
+	var uiAssertionVerifier *oidcauth.Verifier
+	var uiOIDC *httpapi.BrowserOIDC
+	if *uiEnabled {
+		uiPublicOrigin, err = normalizePublicOrigin(os.Getenv("AGENTBUS_UI_PUBLIC_ORIGIN"))
+		if err != nil {
+			slog.Error("invalid AGENTBUS_UI_PUBLIC_ORIGIN", "err", err)
+			os.Exit(2)
+		}
+		uiLogoutURL, err = normalizeUILogoutURL(os.Getenv("AGENTBUS_UI_LOGOUT_URL"))
+		if err != nil {
+			slog.Error("invalid AGENTBUS_UI_LOGOUT_URL", "err", err)
+			os.Exit(2)
+		}
+		uiAssertionVerifier, err = newUIAssertionVerifier(context.Background())
+		if err != nil {
+			slog.Error("UI assertion verifier", "err", err)
+			os.Exit(1)
+		}
+		uiOIDC, err = newUIBrowserOIDC(context.Background(), uiPublicOrigin)
+		if err != nil {
+			slog.Error("UI browser OIDC", "err", err)
+			os.Exit(1)
+		}
 	}
 	api := &httpapi.Server{
 		Bus: b, AdminToken: adminToken, DisableUI: !*uiEnabled,
 		UIAssertionVerifier: uiAssertionVerifier,
 		UIAssertionHeader:   envOr("AGENTBUS_UI_ASSERTION_HEADER", "Cf-Access-Jwt-Assertion"),
+		UIOIDC:              uiOIDC,
 		UIPublicOrigin:      uiPublicOrigin,
 		UILogoutURL:         uiLogoutURL,
 	}
@@ -146,15 +158,27 @@ func main() {
 	if authOn && workloadVerifier != nil {
 		mode = "native+oidc-auth"
 	} else if workloadVerifier != nil {
-		mode = "oidc-mcp-auth (REST/UI remain loopback-only)"
+		mode = "oidc-mcp-auth (REST remains loopback-only)"
 	} else if !authOn {
 		mode = "auth-off (INSECURE dev mode: loopback-only, identities are claims)"
 	}
-	uiMode := "enabled"
+	uiMode := "unavailable without authentication"
 	if !*uiEnabled {
 		uiMode = "disabled"
-	} else if !authOn {
-		uiMode = "unavailable without authentication"
+	} else {
+		var browserModes []string
+		if authOn {
+			browserModes = append(browserModes, "local-code")
+		}
+		if uiAssertionVerifier != nil {
+			browserModes = append(browserModes, "trusted-edge")
+		}
+		if uiOIDC != nil {
+			browserModes = append(browserModes, "native-oidc")
+		}
+		if len(browserModes) > 0 {
+			uiMode = strings.Join(browserModes, "+")
+		}
 	}
 	slog.Info("agentbus listening", "addr", *listen, "db", *dbPath, "mode", mode, "ui", uiMode)
 	srv := newHTTPServer(*listen, logRequests(mux))
@@ -377,6 +401,60 @@ func newUIAssertionVerifier(ctx context.Context) (*oidcauth.Verifier, error) {
 	return oidcauth.New(ctx, issuer, audience, subjectClaim, requiredRole)
 }
 
+func newUIBrowserOIDC(ctx context.Context, publicOrigin string) (*httpapi.BrowserOIDC, error) {
+	issuer := strings.TrimSpace(os.Getenv("AGENTBUS_UI_OIDC_ISSUER"))
+	clientID := strings.TrimSpace(os.Getenv("AGENTBUS_UI_OIDC_CLIENT_ID"))
+	if issuer == "" && clientID == "" {
+		return nil, nil
+	}
+	if issuer == "" || clientID == "" {
+		return nil, errors.New("AGENTBUS_UI_OIDC_ISSUER and AGENTBUS_UI_OIDC_CLIENT_ID must be set together")
+	}
+	expectedRedirectURL := ""
+	if publicOrigin != "" {
+		expectedRedirectURL = strings.TrimSuffix(publicOrigin, "/") + "/ui/auth/oidc/callback"
+	}
+	redirectURL := strings.TrimSpace(os.Getenv("AGENTBUS_UI_OIDC_REDIRECT_URL"))
+	if redirectURL == "" {
+		redirectURL = expectedRedirectURL
+	}
+	if expectedRedirectURL != "" && redirectURL != expectedRedirectURL {
+		return nil, errors.New("AGENTBUS_UI_OIDC_REDIRECT_URL must match AGENTBUS_UI_PUBLIC_ORIGIN callback")
+	}
+	clientSecret, err := loadOptionalSecret("AGENTBUS_UI_OIDC_CLIENT_SECRET", "AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE")
+	if err != nil {
+		return nil, err
+	}
+	return httpapi.NewBrowserOIDC(ctx, httpapi.BrowserOIDCConfig{
+		Issuer:       issuer,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  redirectURL,
+		Scopes:       strings.Fields(os.Getenv("AGENTBUS_UI_OIDC_SCOPES")),
+		SubjectClaim: envOr("AGENTBUS_UI_OIDC_SUBJECT_CLAIM", "sub"),
+		RequiredRole: os.Getenv("AGENTBUS_UI_OIDC_REQUIRED_ROLE"),
+	})
+}
+
+func loadOptionalSecret(valueEnv, fileEnv string) (string, error) {
+	value := os.Getenv(valueEnv)
+	path := strings.TrimSpace(os.Getenv(fileEnv))
+	if value != "" && path != "" {
+		return "", fmt.Errorf("%s and %s are mutually exclusive", valueEnv, fileEnv)
+	}
+	if path != "" {
+		raw, err := credentialfile.Read(path, 8192)
+		if err != nil {
+			return "", err
+		}
+		value = strings.TrimSpace(string(raw))
+	}
+	if len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") {
+		return "", fmt.Errorf("%s must be at most 4096 bytes without newlines", valueEnv)
+	}
+	return value, nil
+}
+
 func normalizePublicOrigin(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -387,6 +465,11 @@ func normalizePublicOrigin(raw string) (string, error) {
 		origin.Host == "" || origin.User != nil || origin.RawQuery != "" ||
 		origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
 		return "", errors.New("must be an absolute http(s) origin without a path, query, credentials, or fragment")
+	}
+	host := origin.Hostname()
+	ip := net.ParseIP(host)
+	if origin.Scheme != "https" && host != "localhost" && host != "agentbus.localhost" && (ip == nil || !ip.IsLoopback()) {
+		return "", errors.New("must use HTTPS except on loopback")
 	}
 	return origin.Scheme + "://" + origin.Host, nil
 }

@@ -163,15 +163,70 @@ resource application's bare client-ID GUID because that is the access token's
 `api://RESOURCE_APP_ID` (or use the explicit
 `api://RESOURCE_APP_ID/.default` scope).
 
-The browser UI supports trusted-edge assertion exchange without making that
-edge the MCP authorization server. Configure `AGENTBUS_UI_ASSERTION_ISSUER`,
+Browser authentication is provider-neutral and independent of MCP resource
+authorization. Deployments can choose any combination of three modes:
+
+- Native OpenID Connect Authorization Code login with PKCE, state, and nonce.
+  AgentBus validates the ID token itself, resolves its `(issuer, subject)`
+  through an explicit `operator` binding, and issues its own opaque UI session.
+- Trusted-edge JWT assertion exchange. This remains useful when an access proxy
+  already owns browser login, but the proxy does not become the MCP
+  authorization server.
+- A loopback one-time code minted with the administrator credential. This is
+  the portable local recovery and single-host mode.
+
+Native browser OIDC uses standard discovery and JWKS and works with Entra ID,
+Keycloak, Authentik, Okta, and other conforming providers:
+
+```text
+AGENTBUS_UI_PUBLIC_ORIGIN=https://agentbus.example.com
+AGENTBUS_UI_OIDC_ISSUER=https://identity.example.com/tenant/v2.0
+AGENTBUS_UI_OIDC_CLIENT_ID=agentbus-browser-client
+AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE=/run/credentials/agentbusd/oidc-client-secret
+AGENTBUS_UI_OIDC_REDIRECT_URL=https://agentbus.example.com/ui/auth/oidc/callback
+AGENTBUS_UI_OIDC_SCOPES=openid profile email
+AGENTBUS_UI_OIDC_SUBJECT_CLAIM=oid
+AGENTBUS_UI_OIDC_REQUIRED_ROLE=AgentBus.Operator
+```
+
+`AGENTBUS_UI_OIDC_ISSUER` and `AGENTBUS_UI_OIDC_CLIENT_ID` must be set together.
+The redirect URL defaults to the exact callback under
+`AGENTBUS_UI_PUBLIC_ORIGIN` and cannot point elsewhere when a public origin is
+configured. Supply the optional confidential-client secret through
+`AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE` where possible, or through
+`AGENTBUS_UI_OIDC_CLIENT_SECRET`; omit both for providers that allow public
+clients. Scopes default to `openid profile email`; `openid` is always added.
+The subject claim is restricted to `sub` or `oid` and defaults to `sub`.
+Required role is optional and expects a top-level JSON `roles` string array;
+providers that use groups, nested realm roles, or another claim need a
+provider-side claim mapping. Discovery is lazy and retryable: provider downtime
+does not prevent daemon startup, but login remains unavailable until discovery
+succeeds. Encrypted flow state does not consume server admission slots;
+consumed-state replay markers, concurrent token exchanges, and per-principal
+sessions are bounded. Bind the resulting identity before login:
+
+```bash
+agentbus bind-identity \
+  --admin-token-file /run/credentials/agentbusd/admin-token \
+  --name operator \
+  --kind operator \
+  --issuer https://identity.example.com/tenant/v2.0 \
+  --subject STABLE_PROVIDER_SUBJECT
+```
+
+Public native OIDC requires TLS, an exact public Host, and outbound HTTPS/DNS
+from the daemon for discovery, JWKS retrieval, and token exchange. The Caddy
+example contains a dedicated `/ui` route that preserves Host, and
+`deploy/systemd/agentbusd-oidc.conf.example` shows secret-file loading and the
+network-policy override required by the intentionally loopback-only base unit.
+HTTPS sessions and flow state use `__Host-` cookies with `Path=/`.
+
+For trusted-edge mode, configure `AGENTBUS_UI_ASSERTION_ISSUER`,
 `AGENTBUS_UI_ASSERTION_AUDIENCE`, `AGENTBUS_UI_ASSERTION_JWKS_URL`, and
 `AGENTBUS_UI_PUBLIC_ORIGIN`; then bind the assertion identity to an `operator`
 mailbox. Set `AGENTBUS_UI_LOGOUT_URL` to the edge provider's HTTPS logout
 endpoint so ending the product session also ends the upstream session instead
-of immediately exchanging the still-valid assertion again. Deployments
-without a trusted edge can keep using the loopback one-time administrator code
-for read-only inspection.
+of immediately exchanging a still-valid assertion again.
 
 Read [SECURITY.md](SECURITY.md) before exposing AgentBus beyond a trusted local
 machine. Operational defaults and recovery procedures live in

@@ -28,7 +28,9 @@ var uiAssets embed.FS
 var uiTemplates = template.Must(template.ParseFS(uiAssets, "ui/*.html"))
 
 type uiLoginView struct {
-	Error string
+	Error       string
+	OIDCEnabled bool
+	CodeEnabled bool
 }
 
 type uiConversationMessage struct {
@@ -46,11 +48,13 @@ type uiConversationView struct {
 }
 
 const (
-	uiBootstrapTTL  = 2 * time.Minute
-	uiSessionTTL    = 8 * time.Hour
-	maxUICodes      = 32
-	maxUISessions   = 64
-	uiSessionCookie = "agentbus_ui_session"
+	uiBootstrapTTL            = 2 * time.Minute
+	uiSessionTTL              = 8 * time.Hour
+	maxUICodes                = 32
+	maxUISessions             = 64
+	maxUISessionsPerPrincipal = 4
+	uiSessionCookie           = "agentbus_ui_session"
+	uiSecureSessionCookie     = "__Host-agentbus_ui_session"
 )
 
 var errUICapacity = errors.New("agentbus: UI credential capacity reached")
@@ -66,6 +70,7 @@ type uiCredentialStore struct {
 
 type uiSession struct {
 	ExpiresAt time.Time
+	CreatedAt time.Time
 	Principal *bus.AuthenticatedPrincipal
 }
 
@@ -152,6 +157,15 @@ func (s *uiCredentialStore) mintPrincipalSession(
 	principal bus.AuthenticatedPrincipal,
 	oldSession string,
 ) (string, uiSession, error) {
+	oldDigest := sha256.Sum256([]byte(oldSession))
+	return s.mintPrincipalSessionReplacing(principal, oldDigest, oldSession != "")
+}
+
+func (s *uiCredentialStore) mintPrincipalSessionReplacing(
+	principal bus.AuthenticatedPrincipal,
+	oldHash [sha256.Size]byte,
+	replacesSession bool,
+) (string, uiSession, error) {
 	raw := make([]byte, 32)
 	s.randomMu.Lock()
 	_, randomErr := io.ReadFull(s.random, raw)
@@ -161,7 +175,6 @@ func (s *uiCredentialStore) mintPrincipalSession(
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	hash := sha256.Sum256([]byte(token))
-	oldHash := sha256.Sum256([]byte(oldSession))
 	now := s.now()
 	expiry := now.Add(uiSessionTTL)
 	if !principal.ExpiresAt.IsZero() && principal.ExpiresAt.Before(expiry) {
@@ -170,16 +183,36 @@ func (s *uiCredentialStore) mintPrincipalSession(
 	if !expiry.After(now) {
 		return "", uiSession{}, errors.New("expired operator assertion")
 	}
-	session := uiSession{ExpiresAt: expiry, Principal: &principal}
+	session := uiSession{ExpiresAt: expiry, CreatedAt: now, Principal: &principal}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
-	_, replacing := s.sessions[oldHash]
+	replaced, replacing := s.sessions[oldHash]
+	replacing = replacesSession && replacing
+	samePrincipalReplacement := replacing && replaced.Principal != nil && replaced.Principal.Name == principal.Name
+	if !samePrincipalReplacement {
+		var oldestHash [sha256.Size]byte
+		var oldestCreatedAt time.Time
+		principalSessions := 0
+		for existingHash, existing := range s.sessions {
+			if existing.Principal == nil || existing.Principal.Name != principal.Name {
+				continue
+			}
+			principalSessions++
+			if oldestCreatedAt.IsZero() || existing.CreatedAt.Before(oldestCreatedAt) {
+				oldestHash = existingHash
+				oldestCreatedAt = existing.CreatedAt
+			}
+		}
+		if principalSessions >= maxUISessionsPerPrincipal {
+			delete(s.sessions, oldestHash)
+		}
+	}
 	if len(s.sessions) >= maxUISessions && !replacing {
 		return "", uiSession{}, errUICapacity
 	}
-	if oldSession != "" {
+	if replacesSession {
 		delete(s.sessions, oldHash)
 	}
 	s.sessions[hash] = session
@@ -261,7 +294,7 @@ func (s *Server) handleUILogin(store *uiCredentialStore) http.HandlerFunc {
 			return
 		}
 		oldSession := ""
-		if cookie, err := r.Cookie(uiSessionCookie); err == nil {
+		if cookie, err := r.Cookie(s.uiSessionCookieName()); err == nil {
 			oldSession = cookie.Value
 		}
 		session, err := store.exchangeCode(form.Get("code"), oldSession)
@@ -270,9 +303,7 @@ func (s *Server) handleUILogin(store *uiCredentialStore) http.HandlerFunc {
 				writeError(w, http.StatusTooManyRequests, errors.New("too many active UI sessions"))
 				return
 			}
-			renderUITemplate(w, http.StatusUnauthorized, "login.html", uiLoginView{
-				Error: "Invalid or expired code. Generate a new code and try again.",
-			})
+			s.renderUILogin(w, http.StatusUnauthorized, "Invalid or expired code. Generate a new code and try again.")
 			return
 		}
 		s.setUISessionCookie(w, session)
@@ -289,6 +320,123 @@ func (s *Server) handleUIRoot(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/ui/", http.StatusPermanentRedirect)
 }
 
+func (s *Server) handleUIOIDCStart(w http.ResponseWriter, r *http.Request) {
+	if s.UIOIDC == nil || !s.uiAvailable(r) {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.sameOriginUIRequest(r) {
+		writeError(w, http.StatusForbidden, errors.New("UI OIDC login refused"))
+		return
+	}
+	previousState := ""
+	if cookie, err := r.Cookie(s.uiOIDCFlowCookieName()); err == nil {
+		previousState = cookie.Value
+	}
+	oldSession := ""
+	if cookie, err := r.Cookie(s.uiSessionCookieName()); err == nil {
+		oldSession = cookie.Value
+	}
+	location, state, err := s.UIOIDC.start(r.Context(), previousState, oldSession)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("UI OIDC login unavailable"))
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.uiOIDCFlowCookieName(),
+		Value:    state,
+		Path:     s.uiOIDCFlowCookiePath(),
+		HttpOnly: true,
+		Secure:   s.uiCookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(uiOIDCFlowTTL.Seconds()),
+	})
+	http.Redirect(w, r, location, http.StatusFound)
+}
+
+func (s *Server) handleUIOIDCCallback(store *uiCredentialStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.UIOIDC == nil || !s.uiAvailable(r) {
+			http.NotFound(w, r)
+			return
+		}
+		stateValues := r.URL.Query()["state"]
+		codeValues := r.URL.Query()["code"]
+		if len(stateValues) != 1 {
+			s.clearUIOIDCFlowCookie(w)
+			http.Error(w, "invalid OIDC callback", http.StatusBadRequest)
+			return
+		}
+		cookie, err := r.Cookie(s.uiOIDCFlowCookieName())
+		if err != nil || !equalToken(cookie.Value, stateValues[0]) {
+			s.clearUIOIDCFlowCookie(w)
+			http.Error(w, "invalid OIDC login state", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("error") == "" && len(codeValues) == 1 {
+			releaseExchange, admitted := s.UIOIDC.beginExchange()
+			if !admitted {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "too many concurrent OIDC logins", http.StatusTooManyRequests)
+				return
+			}
+			defer releaseExchange()
+		}
+		flow, ok := s.UIOIDC.consumeFlow(stateValues[0])
+		s.clearUIOIDCFlowCookie(w)
+		if !ok {
+			http.Error(w, "expired OIDC login state", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("error") != "" || len(codeValues) != 1 {
+			http.Error(w, "identity provider refused login", http.StatusUnauthorized)
+			return
+		}
+		identity, err := s.UIOIDC.exchange(r.Context(), flow, codeValues[0])
+		if err != nil {
+			http.Error(w, "invalid OIDC identity", http.StatusUnauthorized)
+			return
+		}
+		principal, err := s.Bus.AuthenticateExternal(identity.issuer, identity.subject, identity.expiresAt)
+		if err != nil || principal.Kind != "operator" {
+			http.Error(w, "OIDC identity is not bound to an operator", http.StatusUnauthorized)
+			return
+		}
+		oldDigest := flow.oldSessionDigest
+		replacesSession := flow.replacesSession
+		if !replacesSession {
+			if cookie, err := r.Cookie(s.uiSessionCookieName()); err == nil {
+				oldDigest = sha256.Sum256([]byte(cookie.Value))
+				replacesSession = true
+			}
+		}
+		token, _, err := store.mintPrincipalSessionReplacing(principal, oldDigest, replacesSession)
+		if err != nil {
+			if errors.Is(err, errUICapacity) {
+				http.Error(w, "too many active UI sessions", http.StatusTooManyRequests)
+				return
+			}
+			http.Error(w, "OIDC login unavailable", http.StatusUnauthorized)
+			return
+		}
+		s.setUISessionCookie(w, token)
+		w.Header().Set("Location", "/ui/")
+		w.WriteHeader(http.StatusSeeOther)
+	}
+}
+
+func (s *Server) clearUIOIDCFlowCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.uiOIDCFlowCookieName(),
+		Value:    "",
+		Path:     s.uiOIDCFlowCookiePath(),
+		HttpOnly: true,
+		Secure:   s.uiCookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
 func (s *Server) handleUIDashboard(store *uiCredentialStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.uiAvailable(r) {
@@ -301,7 +449,7 @@ func (s *Server) handleUIDashboard(store *uiCredentialStore) http.HandlerFunc {
 		}
 		session, ok := s.authenticateUIRequest(w, r, store)
 		if !ok {
-			renderUITemplate(w, http.StatusOK, "login.html", uiLoginView{})
+			s.renderUILogin(w, http.StatusOK, "")
 			return
 		}
 		if len(r.URL.Query()) != 0 {
@@ -334,7 +482,7 @@ func (s *Server) handleUIMessages(store *uiCredentialStore) http.HandlerFunc {
 		}
 		session, ok := s.authenticateUIRequest(w, r, store)
 		if !ok {
-			renderUITemplate(w, http.StatusOK, "login.html", uiLoginView{})
+			s.renderUILogin(w, http.StatusOK, "")
 			return
 		}
 		beforeSeq, ok := parseUIBeforeSeq(w, r)
@@ -551,7 +699,7 @@ func (s *Server) handleUILogout(store *uiCredentialStore) http.HandlerFunc {
 			writeError(w, http.StatusForbidden, errors.New("UI logout refused"))
 			return
 		}
-		if cookie, err := r.Cookie(uiSessionCookie); err == nil {
+		if cookie, err := r.Cookie(s.uiSessionCookieName()); err == nil {
 			store.revokeSession(cookie.Value)
 		}
 		s.clearUISessionCookie(w)
@@ -570,7 +718,7 @@ func (s *Server) handleUILogout(store *uiCredentialStore) http.HandlerFunc {
 }
 
 func (s *Server) uiAvailable(r *http.Request) bool {
-	if !s.authEnabled() && s.UIAssertionVerifier == nil {
+	if !s.authEnabled() && s.UIAssertionVerifier == nil && s.UIOIDC == nil {
 		return false
 	}
 	if s.UIPublicOrigin == "" {
@@ -587,7 +735,7 @@ func (s *Server) authenticateUIRequest(
 	store *uiCredentialStore,
 ) (uiSession, bool) {
 	oldSession := ""
-	if cookie, err := r.Cookie(uiSessionCookie); err == nil {
+	if cookie, err := r.Cookie(s.uiSessionCookieName()); err == nil {
 		oldSession = cookie.Value
 		if session, ok := store.session(cookie.Value); ok {
 			if session.Principal == nil {
@@ -685,16 +833,24 @@ func renderUITemplate(w http.ResponseWriter, status int, name string, data any) 
 	_, _ = w.Write(rendered.Bytes())
 }
 
+func (s *Server) renderUILogin(w http.ResponseWriter, status int, message string) {
+	renderUITemplate(w, status, "login.html", uiLoginView{
+		Error:       message,
+		OIDCEnabled: s.UIOIDC != nil,
+		CodeEnabled: s.authEnabled(),
+	})
+}
+
 func (s *Server) setUISessionCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, &http.Cookie{
-		Name: uiSessionCookie, Value: value, Path: "/ui", HttpOnly: true,
+		Name: s.uiSessionCookieName(), Value: value, Path: s.uiSessionCookiePath(), HttpOnly: true,
 		Secure: s.uiCookieSecure(), SameSite: http.SameSiteStrictMode,
 	})
 }
 
 func (s *Server) clearUISessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name: uiSessionCookie, Value: "", Path: "/ui", HttpOnly: true,
+		Name: s.uiSessionCookieName(), Value: "", Path: s.uiSessionCookiePath(), HttpOnly: true,
 		Secure: s.uiCookieSecure(), SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 }
@@ -705,6 +861,34 @@ func (s *Server) uiCookieSecure() bool {
 	}
 	origin, err := url.Parse(s.UIPublicOrigin)
 	return err == nil && origin.Scheme == "https"
+}
+
+func (s *Server) uiSessionCookieName() string {
+	if s.uiCookieSecure() {
+		return uiSecureSessionCookie
+	}
+	return uiSessionCookie
+}
+
+func (s *Server) uiSessionCookiePath() string {
+	if s.uiCookieSecure() {
+		return "/"
+	}
+	return "/ui"
+}
+
+func (s *Server) uiOIDCFlowCookieName() string {
+	if s.uiCookieSecure() {
+		return uiSecureOIDCFlowCookie
+	}
+	return uiOIDCFlowCookie
+}
+
+func (s *Server) uiOIDCFlowCookiePath() string {
+	if s.uiCookieSecure() {
+		return "/"
+	}
+	return "/ui/auth/oidc"
 }
 
 func (s *Server) sameOriginUIRequest(r *http.Request) bool {
