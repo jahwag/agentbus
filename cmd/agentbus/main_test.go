@@ -99,6 +99,10 @@ func TestBindAndUnbindIdentityUseEveryDocumentedFlag(t *testing.T) {
 	if err := os.WriteFile(adminFile, []byte("admin-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	subjectFile := filepath.Join(t.TempDir(), "subject")
+	if err := os.WriteFile(subjectFile, []byte("object-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var calls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -132,7 +136,7 @@ func TestBindAndUnbindIdentityUseEveryDocumentedFlag(t *testing.T) {
 		{
 			"bind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
 			"--name", "worker", "--kind", "agent",
-			"--issuer", "https://id.example", "--subject", "object-1",
+			"--issuer", "https://id.example", "--subject-file", subjectFile,
 		},
 		{
 			"unbind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
@@ -147,6 +151,38 @@ func TestBindAndUnbindIdentityUseEveryDocumentedFlag(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("identity API calls = %d", calls)
+	}
+}
+
+func TestIdentitySubjectFileIsExclusiveAndProtected(t *testing.T) {
+	protected := filepath.Join(t.TempDir(), "subject")
+	if err := os.WriteFile(protected, []byte("object-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readIdentitySubject("", protected); err != nil || got != "object-1" {
+		t.Fatalf("readIdentitySubject() = %q, %v", got, err)
+	}
+	if _, err := readIdentitySubject("object-1", protected); err == nil {
+		t.Fatal("subject and subject-file together were accepted")
+	}
+	if _, err := readIdentitySubject("", ""); err == nil {
+		t.Fatal("missing subject source was accepted")
+	}
+
+	exposed := filepath.Join(t.TempDir(), "exposed-subject")
+	if err := os.WriteFile(exposed, []byte("object-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readIdentitySubject("", exposed); err == nil {
+		t.Fatal("group/world-readable subject file was accepted")
+	}
+
+	newline := filepath.Join(t.TempDir(), "newline-subject")
+	if err := os.WriteFile(newline, []byte("object-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readIdentitySubject("", newline); err == nil {
+		t.Fatal("newline-containing subject file was accepted")
 	}
 }
 

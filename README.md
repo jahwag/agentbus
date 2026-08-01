@@ -211,8 +211,12 @@ agentbus bind-identity \
   --name operator \
   --kind operator \
   --issuer https://identity.example.com/tenant/v2.0 \
-  --subject STABLE_PROVIDER_SUBJECT
+  --subject-file /etc/agentbus/operator-subject
 ```
+
+The subject file must be owner-only (or a systemd credential), bounded, and
+free of newline/NUL bytes. `--subject` remains available for interactive use,
+but `--subject-file` keeps stable identity identifiers out of process arguments.
 
 Public native OIDC requires TLS, an exact public Host, and outbound HTTPS/DNS
 from the daemon for discovery, JWKS retrieval, and token exchange. The Caddy

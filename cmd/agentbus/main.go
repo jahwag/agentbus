@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	maxCLIResponseBytes = 512 * 1024
-	maxTokenFileBytes   = 8 * 1024
+	maxCLIResponseBytes         = 512 * 1024
+	maxTokenFileBytes           = 8 * 1024
+	maxIdentitySubjectFileBytes = 16 * 1024
 )
 
 const topLevelHelp = `Usage: agentbus <command> [options]
@@ -209,18 +210,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 		kind := fs.String("kind", "", "agent or operator")
 		issuer := fs.String("issuer", "", "OIDC issuer")
 		subject := fs.String("subject", "", "OIDC subject")
+		subjectFile := fs.String("subject-file", "", "protected file containing the OIDC subject")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if *name == "" || *kind == "" || *issuer == "" || *subject == "" || *adminTokenFile == "" {
-			return errors.New("bind-identity requires --name, --kind, --issuer, --subject, and --admin-token-file")
+		if *name == "" || *kind == "" || *issuer == "" || *adminTokenFile == "" {
+			return errors.New("bind-identity requires --name, --kind, --issuer, --admin-token-file, and exactly one of --subject or --subject-file")
+		}
+		resolvedSubject, err := readIdentitySubject(*subject, *subjectFile)
+		if err != nil {
+			return fmt.Errorf("bind-identity: %w", err)
 		}
 		adminToken, err := readTokenFile(*adminTokenFile)
 		if err != nil {
 			return err
 		}
 		out, err := requestJSON(ctx, client, http.MethodPost, strings.TrimRight(*server, "/")+"/bind-identity", adminToken, map[string]string{
-			"name": *name, "kind": *kind, "issuer": *issuer, "subject": *subject,
+			"name": *name, "kind": *kind, "issuer": *issuer, "subject": resolvedSubject,
 		})
 		if err != nil {
 			return err
@@ -233,18 +239,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 		adminTokenFile := fs.String("admin-token-file", os.Getenv("AGENTBUS_ADMIN_TOKEN_FILE"), "administrator token file")
 		issuer := fs.String("issuer", "", "OIDC issuer")
 		subject := fs.String("subject", "", "OIDC subject")
+		subjectFile := fs.String("subject-file", "", "protected file containing the OIDC subject")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if *issuer == "" || *subject == "" || *adminTokenFile == "" {
-			return errors.New("unbind-identity requires --issuer, --subject, and --admin-token-file")
+		if *issuer == "" || *adminTokenFile == "" {
+			return errors.New("unbind-identity requires --issuer, --admin-token-file, and exactly one of --subject or --subject-file")
+		}
+		resolvedSubject, err := readIdentitySubject(*subject, *subjectFile)
+		if err != nil {
+			return fmt.Errorf("unbind-identity: %w", err)
 		}
 		adminToken, err := readTokenFile(*adminTokenFile)
 		if err != nil {
 			return err
 		}
 		out, err := requestJSON(ctx, client, http.MethodPost, strings.TrimRight(*server, "/")+"/unbind-identity", adminToken, map[string]string{
-			"issuer": *issuer, "subject": *subject,
+			"issuer": *issuer, "subject": resolvedSubject,
 		})
 		if err != nil {
 			return err
@@ -653,6 +664,27 @@ func readTokenFile(path string) (string, error) {
 		return "", errors.New("token file is empty")
 	}
 	return token, nil
+}
+
+func readIdentitySubject(subject, path string) (string, error) {
+	if (subject == "") == (path == "") {
+		return "", errors.New("exactly one of --subject or --subject-file is required")
+	}
+	if path == "" {
+		return subject, nil
+	}
+	raw, err := credentialfile.Read(path, maxIdentitySubjectFileBytes)
+	if err != nil {
+		return "", fmt.Errorf("read subject file: %w", err)
+	}
+	resolved := string(raw)
+	if resolved == "" {
+		return "", errors.New("subject file is empty")
+	}
+	if strings.ContainsAny(resolved, "\x00\r\n") {
+		return "", errors.New("subject file contains a forbidden character")
+	}
+	return resolved, nil
 }
 
 func requestJSON(ctx context.Context, client *http.Client, method, endpoint, token string, body any) ([]byte, error) {
