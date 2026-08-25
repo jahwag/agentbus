@@ -121,12 +121,15 @@ func NewServer(b *bus.Bus, boundName string) *mcp.Server {
 			return bus.AuthenticatedPrincipal{}, false
 		}
 		extra := req.Extra.TokenInfo.Extra
+		if principal, ok := extra["principal"].(bus.AuthenticatedPrincipal); ok {
+			return principal, true
+		}
 		name, hasName := extra["agent"].(string)
 		generation, hasGeneration := extra["credential_generation"].(int64)
 		if !hasName || name == "" || !hasGeneration {
 			return bus.AuthenticatedPrincipal{}, false
 		}
-		return bus.AuthenticatedPrincipal{Name: name, Generation: generation}, true
+		return bus.AuthenticatedPrincipal{Name: name, Kind: "agent", Generation: generation}, true
 	}
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -234,6 +237,12 @@ func publicError(err error) error {
 func Handler(b *bus.Bus) http.Handler {
 	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return NewServer(b, "")
-	}, &mcp.StreamableHTTPOptions{Stateless: true})
+	}, &mcp.StreamableHTTPOptions{
+		Stateless: true,
+		// agentbusd owns the equivalent boundary: unauthenticated mode is
+		// restricted to loopback Host values, while authenticated mode permits
+		// the public Host supplied by its trusted reverse proxy.
+		DisableLocalhostProtection: true,
+	})
 	return http.MaxBytesHandler(h, 256*1024)
 }

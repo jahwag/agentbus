@@ -55,8 +55,8 @@ mail and dead-letters its unsettled receipts.
 _Avoid_: Offline, deletion
 
 **Operator session**:
-A short-lived browser capability restricted to read-only inspection of retained
-AgentBus state.
+A short-lived browser capability for inspection of retained AgentBus state.
+Externally bound operator sessions also allow explicitly scoped direct sends.
 _Avoid_: Admin session, browser admin credential
 
 **Content reveal**:

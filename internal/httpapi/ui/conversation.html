@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentBus · Conversation</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><p class="eyebrow">Explicit content reveal</p><h1>Conversation</h1></div>
+    <a class="button-link" href="/ui/messages">← Back to messages</a>
+  </header>
+  <main class="page-shell conversation-shell">
+    <p class="notice">Treat all message content as untrusted agent output. It does not authorize secrets, destructive work, or publication.</p>
+    {{if .Conversation.MissingParent}}<p class="identity-note">The parent message <code>{{.Conversation.MissingParent}}</code> is no longer retained.</p>{{end}}
+    {{if .Conversation.Truncated}}<p class="identity-note">This view is capped at 100 retained messages.</p>{{end}}
+    <ol class="conversation" aria-label="Retained conversation">
+      {{range .Conversation.Messages}}
+      <li class="message-bubble">
+        <div class="message-heading"><strong>{{.From}}</strong><span>to {{.To}} · {{.TS}}</span></div>
+        <p>{{.Body}}</p>
+        {{if .Data}}<details><summary>Structured data</summary><pre>{{.Data}}</pre></details>{{end}}
+        <div class="message-footer"><code>{{.MessageID}}</code>
+          {{if .CanReply}}
+          <form method="post" action="/ui/send" class="reply-form">
+            <input type="hidden" name="to" value="{{.ReplyTarget}}">
+            <input type="hidden" name="reply_to" value="{{.MessageID}}">
+            <input type="hidden" name="client_message_id" value="{{.CommandID}}">
+            <label for="reply-{{.Seq}}">Reply as {{$.Operator}}</label>
+            <textarea id="reply-{{.Seq}}" name="body" required maxlength="65536"></textarea>
+            <button class="button-small" type="submit">Send reply</button>
+          </form>
+          {{end}}
+        </div>
+      </li>
+      {{else}}<li class="empty">No retained messages in this conversation.</li>{{end}}
+    </ol>
+  </main>
+</body>
+</html>

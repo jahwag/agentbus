@@ -89,6 +89,494 @@ func TestOpenRejectsUnknownMigrationBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestMigrationFiveAddsExternalPrincipalSchema(t *testing.T) {
+	b := open(t)
+	var kind string
+	if err := b.db.QueryRow(
+		`SELECT principal_kind FROM mailboxes LIMIT 1`,
+	).Scan(&kind); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("principal_kind column unavailable: %v", err)
+	}
+	var version int
+	if err := b.db.QueryRow(
+		`SELECT version FROM schema_migrations WHERE version=5`,
+	).Scan(&version); err != nil || version != 5 {
+		t.Fatalf("migration 5 missing: version=%d err=%v", version, err)
+	}
+	if _, err := b.db.Exec(
+		`INSERT INTO external_identities(issuer,subject,mailbox_name)
+		 VALUES('issuer','subject','missing')`,
+	); err == nil {
+		t.Fatal("external identity foreign key was not enforced")
+	}
+}
+
+func TestMigrationFiveUpgradesPopulatedVersionFourDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bus.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations[:4] {
+		if _, err := db.Exec(migration.sql); err != nil {
+			t.Fatal(err)
+		}
+		checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(migration.sql)))
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations(version, checksum) VALUES(?, ?)`,
+			migration.version,
+			checksum,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const token = "pre-migration-agent-token"
+	if _, err := db.Exec(`
+		INSERT INTO mailboxes(name,state,token_hash,credential_generation)
+		VALUES('worker','active',?,7);
+		INSERT INTO mailboxes(name,state)
+		VALUES('recipient','active');
+		INSERT INTO messages(
+			message_id,from_name,to_name,body,encoded_bytes,client_message_id
+		) VALUES(
+			'msg_00000000000000000000000000000001',
+			'worker','recipient','retained before migration',25,'pre-migration-send'
+		);
+		INSERT INTO receipts(mailbox_name,message_seq,state)
+		SELECT 'recipient',seq,'pending' FROM messages`,
+		hashToken(token),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	principal, err := b.AuthenticatePrincipal(token)
+	if err != nil || principal.Name != "worker" || principal.Kind != "agent" ||
+		principal.Generation != 7 {
+		t.Fatalf("migrated principal=%+v error=%v", principal, err)
+	}
+	delivery, err := b.NextDelivery("recipient")
+	if err != nil || delivery == nil || len(delivery.Messages) != 1 ||
+		delivery.Messages[0].Body != "retained before migration" {
+		t.Fatalf("migrated delivery=%+v error=%v", delivery, err)
+	}
+	if err := b.BindExternalIdentity(
+		"worker",
+		"agent",
+		"https://issuer.example.test",
+		"worker-subject",
+	); err != nil {
+		t.Fatal(err)
+	}
+	external, err := b.AuthenticateExternal(
+		"https://issuer.example.test",
+		"worker-subject",
+		time.Now().Add(time.Hour),
+	)
+	if err != nil || external.Name != "worker" || external.Kind != "agent" {
+		t.Fatalf("migrated external principal=%+v error=%v", external, err)
+	}
+}
+
+func TestExternalIdentityBindingSeparatesAgentsAndOperators(t *testing.T) {
+	b := open(t)
+	expires := time.Now().Add(time.Hour)
+	if err := b.BindExternalIdentity("human.alex", "operator", "https://edge.example", "human-1"); err != nil {
+		t.Fatal(err)
+	}
+	operator, err := b.AuthenticateExternal("https://edge.example", "human-1", expires)
+	if err != nil || operator.Name != "human.alex" || operator.Kind != "operator" {
+		t.Fatalf("operator authentication = %+v, %v", operator, err)
+	}
+	if err := b.BindExternalIdentity("worker", "agent", "https://login.example", "agent-1"); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := b.AuthenticateExternal("https://login.example", "agent-1", expires)
+	if err != nil || agent.Kind != "agent" {
+		t.Fatalf("agent authentication = %+v, %v", agent, err)
+	}
+	if err := b.BindExternalIdentity("other", "agent", "https://edge.example", "human-1"); !errors.Is(err, ErrExternalIdentityInUse) {
+		t.Fatalf("duplicate external identity error = %v", err)
+	}
+	if err := b.UnbindExternalIdentity("https://edge.example", "human-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ValidatePrincipal(operator); !errors.Is(err, ErrBadToken) {
+		t.Fatalf("unbound operator session remained valid: %v", err)
+	}
+}
+
+func TestPrincipalKindsAreImmutableAndOperatorsDisallowNativeCredentials(t *testing.T) {
+	b := open(t)
+	token, err := b.Mint("human.alex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"human.alex",
+		"operator",
+		"https://edge.example",
+		"human-1",
+	); !errors.Is(err, ErrPrincipalKindConflict) {
+		t.Fatalf("agent mailbox changed to operator: %v", err)
+	}
+	if _, err := b.AuthenticatePrincipal(token); err != nil {
+		t.Fatalf("failed kind change revoked valid agent credential: %v", err)
+	}
+	if err := b.BindExternalIdentity(
+		"operator.alex",
+		"operator",
+		"https://edge.example",
+		"operator-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Mint("operator.alex"); !errors.Is(err, ErrInvalidPrincipalKind) {
+		t.Fatalf("operator mailbox received a native credential: %v", err)
+	}
+
+	// Defense in depth for any pre-release database created before operators
+	// were forbidden from retaining native credentials.
+	const legacyOperatorToken = "legacy-operator-token"
+	if _, err := b.db.Exec(
+		`UPDATE mailboxes SET token_hash=? WHERE name='operator.alex'`,
+		hashToken(legacyOperatorToken),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.AuthenticatePrincipal(legacyOperatorToken); err != nil {
+		t.Fatalf("test setup did not create legacy operator credential: %v", err)
+	}
+	if err := b.UnbindExternalIdentity("https://edge.example", "operator-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"operator.alex",
+		"operator",
+		"https://edge.example",
+		"operator-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.AuthenticatePrincipal(legacyOperatorToken); !errors.Is(err, ErrBadToken) {
+		t.Fatalf("legacy operator credential survived rebinding: %v", err)
+	}
+}
+
+func TestReservedAgentBindingActivatesWithoutChangingKind(t *testing.T) {
+	b := open(t)
+	if _, err := b.Mint("sender"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send("sender", "future-agent", SendOpts{
+		Body:            "reserved delivery",
+		ClientMessageID: "reserve-agent",
+		AllowNew:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"future-agent",
+		"agent",
+		"https://login.example",
+		"agent-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	principal, err := b.AuthenticateExternal(
+		"https://login.example",
+		"agent-1",
+		time.Now().Add(time.Hour),
+	)
+	if err != nil || principal.Kind != "agent" {
+		t.Fatalf("reserved agent did not activate: principal=%+v err=%v", principal, err)
+	}
+	delivery, err := b.NextDelivery("future-agent")
+	if err != nil || len(delivery.Messages) != 1 {
+		t.Fatalf("reserved delivery was stranded: delivery=%+v err=%v", delivery, err)
+	}
+}
+
+func TestReservedMailboxCanBeReclaimedAsOperatorWithoutStrandedReceipts(t *testing.T) {
+	b := open(t)
+	if _, err := b.Mint("sender"); err != nil {
+		t.Fatal(err)
+	}
+	message, err := b.Send("sender", "future-operator", SendOpts{
+		Body:            "reserved delivery",
+		ClientMessageID: "reserve-operator",
+		AllowNew:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"future-operator",
+		"operator",
+		"https://edge.example",
+		"operator-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	operator, err := b.AuthenticateExternal(
+		"https://edge.example",
+		"operator-1",
+		time.Now().Add(time.Hour),
+	)
+	if err != nil || operator.Kind != "operator" {
+		t.Fatalf("reclaimed operator = %+v, %v", operator, err)
+	}
+	var receipts int
+	if err := b.db.QueryRow(
+		`SELECT COUNT(*) FROM receipts WHERE mailbox_name='future-operator'`,
+	).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 0 {
+		t.Fatalf("operator reclaim stranded %d receipts", receipts)
+	}
+	if _, err := b.MessageContent(message.MessageID); err != nil {
+		t.Fatalf("operator reclaim unexpectedly erased retained routing history: %v", err)
+	}
+	events, err := b.AuditEvents(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var audited bool
+	for _, event := range events {
+		if event.Action == "bind_external_identity" &&
+			event.MailboxName != nil && *event.MailboxName == "future-operator" &&
+			strings.Contains(event.Reason, "discarded_receipts=1") {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatalf("operator reclaim did not audit discarded receipt count: %+v", events)
+	}
+}
+
+func TestOperatorMailboxesAreNotAgentRecipients(t *testing.T) {
+	b := open(t)
+	b.backlogLimits.mailboxReceipts = 1
+	if _, err := b.Mint("worker"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BindExternalIdentity(
+		"human.alex",
+		"operator",
+		"https://edge.example",
+		"human-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	roster, err := b.Roster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roster) != 1 || roster[0].Name != "worker" {
+		t.Fatalf("operator leaked into agent roster: %+v", roster)
+	}
+	operatorReply, err := b.Send("worker", "human.alex", SendOpts{
+		Body:            "operator-visible reply",
+		ClientMessageID: "operator-direct",
+	})
+	if err != nil {
+		t.Fatalf("direct operator reply failed: %v", err)
+	}
+	for i := range 2 {
+		if _, err := b.Send("worker", "*", SendOpts{
+			Body:            "broadcast",
+			ClientMessageID: fmt.Sprintf("operator-broadcast-%d", i),
+		}); err != nil {
+			t.Fatalf("broadcast %d consumed operator backlog: %v", i, err)
+		}
+	}
+	var operatorReceipts int
+	if err := b.db.QueryRow(
+		`SELECT COUNT(*) FROM receipts WHERE mailbox_name='human.alex'`,
+	).Scan(&operatorReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if operatorReceipts != 0 {
+		t.Fatalf("operator received %d agent delivery receipts", operatorReceipts)
+	}
+	routes, err := b.RecentRoutes(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var visible bool
+	for _, route := range routes {
+		visible = visible || route.MessageID == operatorReply.MessageID
+	}
+	conversation, err := b.Conversation(operatorReply.MessageID, 10)
+	if err != nil || len(conversation.Messages) != 1 {
+		t.Fatalf("operator reply was not retained for UI views: %+v, %v", conversation, err)
+	}
+	if !visible {
+		t.Fatalf("operator reply missing from recent routes: %+v", routes)
+	}
+	if _, err := b.Prune(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.MessageContent(operatorReply.MessageID); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("receipt-free operator reply survived retention pruning: %v", err)
+	}
+}
+
+func TestSendAsOperatorIsDirectAttributedAndAudited(t *testing.T) {
+	b := open(t)
+	if err := b.BindExternalIdentity("human.alex", "operator", "https://edge.example", "human-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Mint("worker"); err != nil {
+		t.Fatal(err)
+	}
+	operator, err := b.AuthenticateExternal(
+		"https://edge.example",
+		"human-1",
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := b.SendAsOperator(operator, "worker", SendOpts{
+		Body:            "please report status",
+		ClientMessageID: "server-generated-test-id",
+		AllowNew:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.From != "human.alex" || message.To != "worker" {
+		t.Fatalf("operator attribution = %+v", message)
+	}
+	if _, err := b.SendAsOperator(operator, "*", SendOpts{
+		Body: "broadcast", ClientMessageID: "forbidden-broadcast",
+	}); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("operator broadcast error = %v", err)
+	}
+	events, err := b.AuditEvents(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, event := range events {
+		if event.Action != "operator_send" {
+			continue
+		}
+		found = true
+		if event.SenderName == nil || *event.SenderName != "human.alex" ||
+			event.MailboxName == nil || *event.MailboxName != "worker" ||
+			event.MessageID == nil || *event.MessageID != message.MessageID ||
+			strings.Contains(event.Reason, message.Body) {
+			t.Fatalf("unsafe operator audit event = %+v", event)
+		}
+	}
+	if !found {
+		t.Fatal("operator_send audit event missing")
+	}
+}
+
+func TestConversationIsBoundedAndReportsPrunedParent(t *testing.T) {
+	b := open(t)
+	root, err := b.Send("amara", "athena", SendOpts{
+		Body: "root", ClientMessageID: "conversation-root", AllowNew: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := root.MessageID
+	for i := 0; i < 110; i++ {
+		from, to := "athena", "amara"
+		if i%2 == 1 {
+			from, to = to, from
+		}
+		message, err := b.Send(from, to, SendOpts{
+			Body:            fmt.Sprintf("reply-%d", i),
+			ReplyTo:         &parent,
+			ClientMessageID: fmt.Sprintf("conversation-%d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent = message.MessageID
+	}
+	conversation, err := b.Conversation(parent, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conversation.Messages) != 100 || !conversation.Truncated {
+		t.Fatalf("conversation bounds = %d truncated=%v", len(conversation.Messages), conversation.Truncated)
+	}
+
+	child := conversation.Messages[1]
+	if _, err := b.db.Exec(`DELETE FROM messages WHERE message_id=?`, conversation.Messages[0].MessageID); err != nil {
+		t.Fatal(err)
+	}
+	afterPrune, err := b.Conversation(child.MessageID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterPrune.MissingParent == "" || len(afterPrune.Messages) == 0 ||
+		afterPrune.Messages[0].MessageID != child.MessageID {
+		t.Fatalf("pruned-parent conversation = %+v", afterPrune)
+	}
+}
+
+func TestConversationBoundsWideReplyTreesInsideRecursiveWalk(t *testing.T) {
+	b := open(t)
+	root, err := b.Send("amara", "athena", SendOpts{
+		Body: "root", ClientMessageID: "wide-conversation-root", AllowNew: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := b.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for i := 0; i < 2_000; i++ {
+		messageID := fmt.Sprintf("msg_%032x", i+1)
+		if _, err := tx.Exec(
+			`INSERT INTO messages(
+				message_id,from_name,to_name,body,reply_to,encoded_bytes,client_message_id
+			 ) VALUES(?,?,?,?,?,?,?)`,
+			messageID,
+			"athena",
+			"amara",
+			"wide reply",
+			root.MessageID,
+			64,
+			fmt.Sprintf("wide-conversation-%d", i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := b.Conversation(root.MessageID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conversation.Messages) != 100 || !conversation.Truncated {
+		t.Fatalf(
+			"wide conversation bounds = %d truncated=%v",
+			len(conversation.Messages),
+			conversation.Truncated,
+		)
+	}
+}
+
 func TestOpenRefusesSecondOwnerOfDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "owned.db")
 	first, err := Open(path)

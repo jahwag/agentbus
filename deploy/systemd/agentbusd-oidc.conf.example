@@ -1,0 +1,22 @@
+# Optional systemd drop-in for a native browser OIDC deployment.
+# Install as /etc/systemd/system/agentbusd.service.d/oidc.conf only after
+# replacing every example value. Keep the client-secret source root-owned
+# and mode 0600; systemd exposes it to AgentBus as a read-only credential.
+
+[Service]
+LoadCredential=oidc-client-secret:/etc/agentbus/oidc-client-secret
+Environment="AGENTBUS_UI_PUBLIC_ORIGIN=https://agentbus.example.com"
+Environment="AGENTBUS_UI_OIDC_ISSUER=https://identity.example.com/tenant/v2.0"
+Environment="AGENTBUS_UI_OIDC_CLIENT_ID=agentbus-browser-client"
+Environment="AGENTBUS_UI_OIDC_CLIENT_SECRET_FILE=%d/oidc-client-secret"
+Environment="AGENTBUS_UI_OIDC_REDIRECT_URL=https://agentbus.example.com/ui/auth/oidc/callback"
+Environment="AGENTBUS_UI_OIDC_SCOPES=openid profile email"
+Environment="AGENTBUS_UI_OIDC_SUBJECT_CLAIM=sub"
+
+# The base unit intentionally permits loopback networking only. OIDC
+# discovery, JWKS retrieval, and token exchange require outbound HTTPS and
+# DNS. Empty assignments reset both lists. Enforce a narrower egress policy
+# outside this portable example when the provider's stable network ranges and
+# the host resolver make that practical.
+IPAddressDeny=
+IPAddressAllow=

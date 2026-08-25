@@ -94,6 +94,98 @@ func TestUISessionUsesAdminCredentialWithoutPrintingIt(t *testing.T) {
 	}
 }
 
+func TestBindAndUnbindIdentityUseEveryDocumentedFlag(t *testing.T) {
+	adminFile := filepath.Join(t.TempDir(), "admin.token")
+	if err := os.WriteFile(adminFile, []byte("admin-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	subjectFile := filepath.Join(t.TempDir(), "subject")
+	if err := os.WriteFile(subjectFile, []byte("object-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.Header.Get("Authorization"); got != "Bearer admin-secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		switch r.URL.Path {
+		case "/bind-identity":
+			if body["name"] != "worker" || body["kind"] != "agent" ||
+				body["issuer"] != "https://id.example" || body["subject"] != "object-1" {
+				t.Fatalf("bind body = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"bound":true}`))
+		case "/unbind-identity":
+			if len(body) != 2 || body["issuer"] != "https://id.example" ||
+				body["subject"] != "object-1" {
+				t.Fatalf("unbind body = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"unbound":true}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	for _, args := range [][]string{
+		{
+			"bind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
+			"--name", "worker", "--kind", "agent",
+			"--issuer", "https://id.example", "--subject-file", subjectFile,
+		},
+		{
+			"unbind-identity", "--server", ts.URL, "--admin-token-file", adminFile,
+			"--issuer", "https://id.example", "--subject", "object-1",
+		},
+	} {
+		if err := execute(
+			context.Background(), args, io.Discard, io.Discard, ts.Client(),
+		); err != nil {
+			t.Fatalf("%s: %v", args[0], err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("identity API calls = %d", calls)
+	}
+}
+
+func TestIdentitySubjectFileIsExclusiveAndProtected(t *testing.T) {
+	protected := filepath.Join(t.TempDir(), "subject")
+	if err := os.WriteFile(protected, []byte("object-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readIdentitySubject("", protected); err != nil || got != "object-1" {
+		t.Fatalf("readIdentitySubject() = %q, %v", got, err)
+	}
+	if _, err := readIdentitySubject("object-1", protected); err == nil {
+		t.Fatal("subject and subject-file together were accepted")
+	}
+	if _, err := readIdentitySubject("", ""); err == nil {
+		t.Fatal("missing subject source was accepted")
+	}
+
+	exposed := filepath.Join(t.TempDir(), "exposed-subject")
+	if err := os.WriteFile(exposed, []byte("object-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readIdentitySubject("", exposed); err == nil {
+		t.Fatal("group/world-readable subject file was accepted")
+	}
+
+	newline := filepath.Join(t.TempDir(), "newline-subject")
+	if err := os.WriteFile(newline, []byte("object-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readIdentitySubject("", newline); err == nil {
+		t.Fatal("newline-containing subject file was accepted")
+	}
+}
+
 func TestSendCarriesStructuredPayloadAndPrintsMessage(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "agent.token")
 	if err := os.WriteFile(tokenFile, []byte("agent-secret\n"), 0o600); err != nil {

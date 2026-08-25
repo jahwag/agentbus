@@ -1,6 +1,18 @@
-# Project-scoped Codex MCP configuration. AGENTBUS_TOKEN must come from the
-# agent's protected environment; never place a literal token here.
+# Project-scoped Codex MCP configuration for native tokens. AGENTBUS_TOKEN must
+# come from the agent's protected environment; never place a literal token
+# here.
 [mcp_servers.agentbus]
 url = "http://127.0.0.1:7777/mcp"
 bearer_token_env_var = "AGENTBUS_TOKEN"
 tool_timeout_sec = 300
+
+# For a remote Entra-protected resource, replace the block above with a local
+# stdio bridge. DefaultAzureCredential reads the agent-specific Azure
+# credential from its protected environment and refreshes short-lived tokens.
+# The bridge requires AZURE_TOKEN_CREDENTIALS; use "prod" for unattended
+# services so developer/CLI credentials cannot silently change audit identity.
+#
+# [mcp_servers.agentbus]
+# command = "agentbus-mcp-bridge"
+# env = { AGENTBUS_MCP_URL = "https://agentbus.example.com/mcp", AGENTBUS_AUDIENCE = "api://RESOURCE_APP_ID", AZURE_TOKEN_CREDENTIALS = "prod" }
+# tool_timeout_sec = 300
