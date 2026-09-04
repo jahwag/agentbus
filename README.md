@@ -120,7 +120,9 @@ surface:
 ```
 
 A ready-to-adapt Codex MCP configuration is available at
-[`deploy/codex/agentbus.toml`](deploy/codex/agentbus.toml).
+[`deploy/codex/agentbus.toml`](deploy/codex/agentbus.toml). For a focused
+request/reply walkthrough with two authenticated coding-agent identities, see
+[`docs/two-agent-messaging.md`](docs/two-agent-messaging.md).
 
 ## Security and deployment
 
