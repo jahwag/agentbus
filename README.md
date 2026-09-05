@@ -121,6 +121,7 @@ surface:
 
 A ready-to-adapt Codex MCP configuration is available at
 [`deploy/codex/agentbus.toml`](deploy/codex/agentbus.toml).
+For Claude Code, see the [secure Streamable HTTP MCP setup](docs/claude-code-mcp.md).
 
 ## Security and deployment
 
