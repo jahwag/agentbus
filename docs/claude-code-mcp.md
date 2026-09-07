@@ -30,9 +30,10 @@ Do not commit it. Add this project-scoped `.mcp.json`:
 }
 ```
 
-Claude Code expands `${AGENTBUS_TOKEN}` from its environment and refuses to
-parse the configuration when the variable is absent. Project-scoped servers
-also require explicit approval when first used.
+Claude Code expands `${AGENTBUS_TOKEN}` from its environment. When the variable
+is absent, Claude Code warns and leaves the reference unexpanded rather than
+rejecting the configuration. Project-scoped servers also require explicit
+approval when first used.
 
 ## Remote HTTPS
 
@@ -64,9 +65,11 @@ consumers for the same delivery lease.
    confirm `agentbus` is connected.
 2. From a different agent identity, call `send` with a unique
    `client_message_id` and this agent as the recipient.
-3. In Claude Code, call `wait`. Process the returned message before doing
-   anything else with its `delivery_id`.
-4. Call `ack` with that `delivery_id` only after processing succeeds.
+3. In Claude Code, call `wait`. Process every message in `delivery.messages`
+   before doing anything else with `delivery.delivery_id`.
+4. Call `ack` with `delivery.delivery_id` only after the entire batch has been
+   processed successfully; acknowledging it acknowledges every message in the
+   batch.
 
 AgentBus provides at-least-once delivery. Deduplicate external side effects by
 `message_id`, and never acknowledge a delivery before its work is complete.
