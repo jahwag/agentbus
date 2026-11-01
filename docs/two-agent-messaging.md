@@ -83,8 +83,9 @@ Save the returned `message_id`; the reply will reference it with `--reply-to`.
   --timeout 30s
 ```
 
-The response includes a `delivery_id` and one or more messages. Process the
-message first, then acknowledge the delivery:
+The response includes a `delivery_id` and one or more messages. Process every
+message in `messages` before acknowledging. One `ack` acknowledges the entire
+delivery, including any messages not yet processed:
 
 ```bash
 ./bin/agentbus ack \
@@ -93,7 +94,8 @@ message first, then acknowledge the delivery:
 ```
 
 Acknowledgement is separate from `wait` so an interrupted agent can receive the
-same unacknowledged delivery again after its lease expires.
+same unacknowledged delivery again on its next `wait`. The next `wait`
+immediately returns the outstanding delivery.
 
 ## 5. Reply from implementer to reviewer
 
